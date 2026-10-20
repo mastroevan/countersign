@@ -20,3 +20,15 @@ request IDs. Defects found by code review and fixed:
   Now uses `COUNTERSIGN_DEVICE_TZ`; with no zone the frame is ignored.
 - **`get_camera_frames` fallback was dead code**, and `stop_whep` could raise
   from cleanup. Both fixed.
+
+## 2026-10-20 — `mcp` 2.x removed `mcp.server.fastmcp`
+
+- Request ID: n/a (import-time failure, no network call).
+- Expected: `from mcp.server.fastmcp import FastMCP` works with the `mcp`
+  package pyproject resolved (2.3.0), as in 1.x examples and CLAUDE.md.
+- Actual: `ModuleNotFoundError`; 2.x renamed it to `MCPServer`.
+- Resolution: depend on the standalone `fastmcp` package (4.1.3, which runs
+  alongside mcp 2.3.0) and drop the direct `mcp` and unused `easypost`
+  dependencies. Streamable HTTP initialize with protocol 2025-11-25 is covered
+  by `tests/test_mcp.py`. Note `mcp.types.LATEST_PROTOCOL_VERSION` is now
+  2026-07-28, newer than the 2025-11-25 in CLAUDE.md.

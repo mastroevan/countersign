@@ -16,18 +16,22 @@ import logging
 import os
 import unicodedata
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone
-from typing import Any, Literal
+from contextlib import asynccontextmanager
+from datetime import datetime
+from typing import Any, AsyncIterator, Literal
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import AwareDatetime, BaseModel, Field
 
-from countersign.evidence import EvidenceSink, S3Sink, draft_claim
+from countersign.evidence import EvidenceSink
 from countersign.frames import OFFLINE_ENV
-from countersign.ledger import ACTIONS, Action, Approval, Ledger, Verification
+from countersign.ledger import Ledger
+from countersign.mcp_server import build_mcp
 from countersign.pipeline import VerificationResult, verify_delivery
-from countersign.policy import PolicyConfig, Verdict
+from countersign.policy import PolicyConfig
 from countersign.ring_client import RingClient
+from countersign.service import ServiceError, VerificationService
 from countersign.vision_judge import device_tz_from_env
 
 log = logging.getLogger("countersign")
@@ -77,32 +81,20 @@ def create_app(
     ledger: Ledger | None = None,
     sink: EvidenceSink | None = None,
 ) -> FastAPI:
-    app = FastAPI(title="Countersign")
-    store = ledger or Ledger()
-    run_verifier = verifier or default_verifier()
-    sinks: list[EvidenceSink] = [sink] if sink else []
+    service = VerificationService(verifier or default_verifier(), ledger, sink)
+    mcp_app = build_mcp(service).http_app(path="/")
 
-    def get_sink() -> EvidenceSink:
-        if not sinks:
-            sinks.append(S3Sink())
-        return sinks[0]
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        async with mcp_app.lifespan(mcp_app):
+            yield
 
-    async def run_verification(vid: str) -> None:
-        v = store.get(vid)
-        assert v is not None
-        try:
-            v.result = await run_verifier(v.delivered_at, v.simulate)
-            v.status = "complete"
-        except Exception as exc:
-            log.exception("verification %s failed", vid)
-            v.error = f"{type(exc).__name__}: {exc}"
-            v.status = "failed"
+    app = FastAPI(title="Countersign", lifespan=lifespan)
+    app.mount("/mcp", mcp_app)  # Streamable HTTP MCP endpoint at /mcp/
 
-    def need(vid: str) -> Verification:
-        v = store.get(vid)
-        if v is None:
-            raise HTTPException(404, "verification not found")
-        return v
+    @app.exception_handler(ServiceError)
+    async def service_error(_: Request, exc: ServiceError) -> JSONResponse:
+        return JSONResponse({"detail": exc.detail}, status_code=exc.status)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
@@ -110,13 +102,13 @@ def create_app(
 
     @app.post("/verify", status_code=202)
     async def verify(req: VerifyRequest, tasks: BackgroundTasks) -> dict[str, Any]:
-        v, _ = store.create(
+        v, _ = service.start(
             source="manual",
             delivered_at=req.delivered_at,
             tracking_code=req.tracking_code,
             simulate=req.simulate,
         )
-        tasks.add_task(run_verification, v.id)
+        tasks.add_task(service.run, v.id)
         return {"id": v.id, "status": v.status, "requires_approval": True}
 
     @app.post("/webhooks/easypost", status_code=202)
@@ -137,74 +129,37 @@ def create_app(
         if delivered_at is None:
             raise HTTPException(422, "no timezone-aware delivery timestamp in event")
 
-        v, created = store.create(
+        v, created = service.start(
             source="webhook",
             delivered_at=delivered_at,
             tracking_code=result.get("tracking_code"),
             event_id=event.get("id"),
         )
         if created:
-            tasks.add_task(run_verification, v.id)
+            tasks.add_task(service.run, v.id)
         return {"id": v.id, "status": v.status, "duplicate": not created}
 
     @app.get("/verifications")
     async def list_verifications() -> list[dict[str, Any]]:
-        return [v.to_dict() for v in store.list()]
+        return [v.to_dict() for v in service.list()]
 
     @app.get("/verifications/{vid}")
     async def get_verification(vid: str) -> dict[str, Any]:
-        return need(vid).to_dict()
+        return service.get(vid).to_dict()
 
     @app.post("/verifications/{vid}/approvals")
     async def record_approval(vid: str, req: ApprovalRequest) -> dict[str, Any]:
-        v = need(vid)
-        _require_actionable(v, req.action)
-        if not req.approver.strip():
-            raise HTTPException(422, "approver must name a person")
-        v.approvals[req.action] = Approval(
-            req.action, req.approved, req.approver.strip(), datetime.now(timezone.utc)
-        )
-        return v.to_dict()
+        return service.record_approval(vid, req.action, req.approved, req.approver).to_dict()
 
     @app.post("/verifications/{vid}/claim-draft")
     async def make_claim_draft(vid: str) -> dict[str, Any]:
-        v = need(vid)
-        _require_actionable(v, "claim_draft")
-        _require_approved(v, "claim_draft")
-        if v.claim_draft is None:
-            v.claim_draft = draft_claim(v)
-        return v.claim_draft
+        return service.claim_draft(vid)
 
     @app.post("/verifications/{vid}/evidence-packet")
     async def make_evidence_packet(vid: str) -> dict[str, Any]:
-        v = need(vid)
-        _require_actionable(v, "evidence_packet")
-        _require_approved(v, "evidence_packet")
-        if v.evidence_location is None:
-            v.evidence_location = await get_sink().put_packet(v)
-        return {"location": v.evidence_location}
+        return {"location": await service.evidence_packet(vid)}
 
     return app
-
-
-def _require_actionable(v: Verification, action: Action) -> None:
-    """Refuse approvals/actions that must never happen, before asking a human."""
-    if action not in ACTIONS:
-        raise HTTPException(422, "unknown action")
-    if v.status != "complete" or v.result is None:
-        raise HTTPException(409, f"verification is {v.status}, not complete")
-    if v.synthetic:
-        raise HTTPException(409, "synthetic/simulated evidence can never back a claim or packet")
-    if action == "claim_draft" and v.result.decision.verdict is not Verdict.DISPUTED:
-        raise HTTPException(409, "claims can only be drafted for DISPUTED verdicts")
-
-
-def _require_approved(v: Verification, action: Action) -> None:
-    ap = v.approvals.get(action)
-    if ap is None or not ap.approved:
-        raise HTTPException(
-            409, {"error": "approval_required", "action": action, "requires_approval": True}
-        )
 
 
 def _valid_signature(secret: str, body: bytes, headers: Any) -> bool:
