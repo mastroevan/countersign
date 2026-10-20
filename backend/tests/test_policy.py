@@ -58,7 +58,27 @@ def test_naive_vs_aware_timestamp_unusable():
 
 
 def test_disallowed_location_not_positive():
-    assert decide([obs(loc="driveway")], T0).verdict is Verdict.INCONCLUSIVE
+    d = decide([obs(loc="driveway")], T0)
+    assert d.verdict is Verdict.INCONCLUSIVE
+    assert "driveway" in d.reason
+
+
+def test_pre_delivery_absence_then_post_delivery_parcel_is_verified():
+    # Empty porch before carrier arrives followed by parcel after scan is VERIFIED, not conflict
+    pre_scan_empty = obs(visible=False, dt=-timedelta(minutes=2))
+    post_scan_parcel = obs(visible=True, dt=timedelta(minutes=2))
+    d = decide([pre_scan_empty, post_scan_parcel], T0)
+    assert d.verdict is Verdict.VERIFIED
+    assert d.positive_frames == 1
+    assert d.negative_frames == 0
+
+
+def test_pre_delivery_negatives_do_not_dispute():
+    # Negative frames before delivery cannot dispute a delivery scan
+    early1 = obs(visible=False, dt=-timedelta(minutes=4))
+    early2 = obs(visible=False, dt=-timedelta(minutes=2))
+    d = decide([early1, early2], T0)
+    assert d.verdict is Verdict.INCONCLUSIVE
 
 
 def test_custom_config():

@@ -10,12 +10,13 @@ schema has no field that could carry such a description.
 from __future__ import annotations
 
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from countersign.policy import Observation
 
-DEFAULT_MODEL_ID_ENV = "COUNTERSIGN_BEDROCK_MODEL_ID"
+DEFAULT_MODEL_ID_ENV = "BEDROCK_MODEL_ID"
+LEGACY_MODEL_ID_ENV = "COUNTERSIGN_BEDROCK_MODEL_ID"
 TOOL_NAME = "report_observation"
 
 SYSTEM_PROMPT = (
@@ -75,9 +76,15 @@ def judge_frame(
     model_id: str | None = None,
 ) -> Observation:
     """Send one frame to Bedrock Converse and return a validated Observation."""
-    model = model_id or os.environ.get(DEFAULT_MODEL_ID_ENV)
+    model = (
+        model_id
+        or os.environ.get(DEFAULT_MODEL_ID_ENV)
+        or os.environ.get(LEGACY_MODEL_ID_ENV)
+    )
     if not model:
-        raise VisionJudgeError(f"set {DEFAULT_MODEL_ID_ENV} or pass model_id")
+        raise VisionJudgeError(
+            f"set {DEFAULT_MODEL_ID_ENV} (or {LEGACY_MODEL_ID_ENV}) or pass model_id"
+        )
 
     response = client.converse(
         modelId=model,
@@ -139,7 +146,28 @@ def _to_observation(data: dict[str, Any]) -> Observation:
 def _parse_ts(value: object) -> datetime | None:
     if not isinstance(value, str) or not value.strip():
         return None
+    cleaned = value.strip()
     try:
-        return datetime.fromisoformat(value.strip())
+        dt = datetime.fromisoformat(cleaned)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
     except ValueError:
-        return None
+        pass
+
+    common_formats = [
+        "%Y-%m-%d %H:%M:%S",
+        "%m/%d/%Y %I:%M:%S %p",
+        "%m/%d/%Y %H:%M:%S",
+        "%Y/%m/%d %H:%M:%S",
+        "%m/%d/%y %I:%M:%S %p",
+    ]
+    for fmt in common_formats:
+        try:
+            dt = datetime.strptime(cleaned, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt
+        except ValueError:
+            continue
+    return None

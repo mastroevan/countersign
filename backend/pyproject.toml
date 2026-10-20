@@ -2,10 +2,26 @@
 name = "countersign"
 version = "0.1.0"
 requires-python = ">=3.11"
-dependencies = ["boto3"]
+dependencies = [
+    "boto3",
+    "fastapi",
+    "uvicorn",
+    "httpx",
+    "pydantic",
+    "pillow",
+    "aiortc",
+    "easypost",
+    "mcp",
+]
 
 [project.optional-dependencies]
-dev = ["pytest", "pytest-asyncio", "mypy", "boto3-stubs[bedrock-runtime]"]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "mypy",
+    "boto3-stubs[bedrock-runtime]",
+    "types-Pillow",
+]
 
 [build-system]
 requires = ["setuptools>=68"]
