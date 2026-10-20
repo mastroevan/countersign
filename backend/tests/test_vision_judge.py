@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 
 import pytest
+from zoneinfo import ZoneInfo
 
 from countersign.vision_judge import (
     TOOL_NAME,
@@ -79,16 +80,42 @@ def test_judge_frame_request_shape():
     assert call["messages"][0]["content"][0]["image"]["source"]["bytes"] == b"img"
 
 
-def test_parses_human_watermark_timestamp():
-    o = parse_response(
-        resp(
-            parcel_visible=True,
-            location="porch",
-            confidence=0.9,
-            watermark_timestamp="10/15/2026 12:01:00 PM",
-        )
-    )
+def _human(ts):
+    return resp(parcel_visible=True, location="porch", confidence=0.9, watermark_timestamp=ts)
+
+
+def test_zoneless_watermark_stays_naive_without_device_tz():
+    # Guessing UTC would shift frames by hours; the policy ignores naive times.
+    o = parse_response(_human("10/15/2026 12:01:00 PM"))
+    assert o.watermark_ts == datetime(2026, 10, 15, 12, 1)
+    assert o.watermark_ts.tzinfo is None
+
+
+def test_zoneless_watermark_uses_device_tz():
+    tz = ZoneInfo("America/New_York")
+    o = parse_response(_human("10/15/2026 12:01:00 PM"), device_tz=tz)
+    assert o.watermark_ts == datetime(2026, 10, 15, 16, 1, tzinfo=timezone.utc)
+
+
+def test_explicit_utc_suffix_wins_over_device_tz():
+    tz = ZoneInfo("America/New_York")
+    o = parse_response(_human("10/15/2026 12:01:00 PM UTC"), device_tz=tz)
     assert o.watermark_ts == datetime(2026, 10, 15, 12, 1, tzinfo=timezone.utc)
+
+
+def test_device_tz_from_env(monkeypatch):
+    monkeypatch.setenv("BEDROCK_MODEL_ID", "m")
+    monkeypatch.setenv("COUNTERSIGN_DEVICE_TZ", "America/Chicago")
+    client = StubClient(_human("2026-10-15 12:01:00"))
+    o = judge_frame(client, b"img")
+    assert o.watermark_ts == datetime(2026, 10, 15, 17, 1, tzinfo=timezone.utc)
+
+
+def test_judge_tags_source_and_frame_id(monkeypatch):
+    monkeypatch.setenv("BEDROCK_MODEL_ID", "m")
+    o = judge_frame(StubClient(_human("")), b"img", source="synthetic")
+    assert o.source == "synthetic"
+    assert o.frame_id and len(o.frame_id) == 16
 
 
 def test_requires_model_id(monkeypatch):
