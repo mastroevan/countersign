@@ -80,7 +80,16 @@ def decide(
         for o in confident
         if o.parcel_visible and o.location in config.allowed_locations
     ]
-    negative = [o for o in confident if not o.parcel_visible]
+    # Negative frames that dispute delivery must occur at or after carrier scan time.
+    # Pre-delivery absence (porch empty before carrier arrives) is normal baseline,
+    # not evidence of non-delivery.
+    negative = [
+        o
+        for o in confident
+        if not o.parcel_visible
+        and o.watermark_ts is not None
+        and o.watermark_ts >= delivered_at
+    ]
     n_pos, n_neg, n_all = len(positive), len(negative), len(confident)
 
     def result(verdict: Verdict, reason: str) -> Decision:
@@ -94,6 +103,19 @@ def decide(
         return result(Verdict.VERIFIED, "parcel confidently visible in window")
     if n_neg >= config.min_negative_frames:
         return result(Verdict.DISPUTED, "parcel confidently absent in window")
+
+    disallowed_locations = [
+        o
+        for o in confident
+        if o.parcel_visible and o.location not in config.allowed_locations
+    ]
+    if disallowed_locations:
+        locs = ", ".join(sorted({str(o.location) for o in disallowed_locations}))
+        return result(
+            Verdict.INCONCLUSIVE,
+            f"parcel visible outside allowed delivery area ({locs})",
+        )
+
     return result(Verdict.INCONCLUSIVE, "insufficient confident evidence")
 
 
