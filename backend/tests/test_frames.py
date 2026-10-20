@@ -7,8 +7,10 @@ from countersign.frames import (
     create_synthetic_frame,
     image_to_jpeg,
     get_camera_frames,
+    Frame,
     FrameCaptureError,
 )
+import countersign.frames as frames_mod
 from countersign.ring_client import RingClient
 
 
@@ -36,16 +38,55 @@ def test_image_to_jpeg():
 
 
 @pytest.mark.asyncio
-async def test_get_camera_frames_synthetic():
-    client = RingClient(token="dummy")
+async def test_force_synthetic_tags_frames():
     frames = await get_camera_frames(
-        client,
-        device_id="dummy-dev",
-        n_frames=3,
-        use_synthetic_fallback=True,
-        synthetic_has_parcel=True,
+        RingClient(token="dummy"), "dev", n_frames=3, force_synthetic=True
     )
     assert len(frames) == 3
-    for frame in frames:
-        img = Image.open(io.BytesIO(frame))
-        assert img.format == "JPEG"
+    for f in frames:
+        assert f.source == "synthetic"
+        assert Image.open(io.BytesIO(f.jpeg)).format == "JPEG"
+        assert len(f.frame_id) == 16
+
+
+@pytest.mark.asyncio
+async def test_offline_env_forces_synthetic(monkeypatch):
+    monkeypatch.setenv("COUNTERSIGN_OFFLINE_SIMULATION", "true")
+    frames = await get_camera_frames(RingClient(token="dummy"), "dev", n_frames=1)
+    assert [f.source for f in frames] == ["synthetic"]
+
+
+@pytest.mark.asyncio
+async def test_live_failure_raises_without_fallback(monkeypatch):
+    async def boom(*a, **k):
+        raise FrameCaptureError("no stream")
+
+    monkeypatch.delenv("COUNTERSIGN_OFFLINE_SIMULATION", raising=False)
+    monkeypatch.setattr(frames_mod, "grab_frames", boom)
+    with pytest.raises(FrameCaptureError):
+        await get_camera_frames(RingClient(token="dummy"), "dev")
+
+
+@pytest.mark.asyncio
+async def test_live_failure_falls_back_when_requested(monkeypatch):
+    async def boom(*a, **k):
+        raise FrameCaptureError("no stream")
+
+    monkeypatch.delenv("COUNTERSIGN_OFFLINE_SIMULATION", raising=False)
+    monkeypatch.setattr(frames_mod, "grab_frames", boom)
+    frames = await get_camera_frames(
+        RingClient(token="dummy"), "dev", n_frames=2, fallback_to_synthetic=True
+    )
+    assert [f.source for f in frames] == ["synthetic", "synthetic"]
+
+
+@pytest.mark.asyncio
+async def test_live_success_passes_through(monkeypatch):
+    live = [Frame(b"x", "live", datetime.now(timezone.utc))]
+
+    async def ok(*a, **k):
+        return live
+
+    monkeypatch.delenv("COUNTERSIGN_OFFLINE_SIMULATION", raising=False)
+    monkeypatch.setattr(frames_mod, "grab_frames", ok)
+    assert await get_camera_frames(RingClient(token="dummy"), "dev") == live

@@ -7,14 +7,17 @@ Includes an offline test frame generator for local testing and simulations.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import os
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont
 
-from countersign.ring_client import RingClient, RingClientError
+from countersign.policy import Source
+from countersign.ring_client import RingClient
 
 # Check if aiortc is available
 try:
@@ -24,8 +27,24 @@ except ImportError:  # pragma: no cover
     AIORTC_AVAILABLE = False
 
 
+OFFLINE_ENV = "COUNTERSIGN_OFFLINE_SIMULATION"
+
+
 class FrameCaptureError(RuntimeError):
     """Failed to acquire video frames from camera feed."""
+
+
+@dataclass(frozen=True)
+class Frame:
+    """A JPEG plus provenance. ``source`` follows the frame through the policy."""
+
+    jpeg: bytes
+    source: Source
+    captured_at: datetime  # server-side capture time, independent of the watermark
+
+    @property
+    def frame_id(self) -> str:
+        return hashlib.sha256(self.jpeg).hexdigest()[:16]
 
 
 def image_to_jpeg(image: Image.Image, quality: int = 85) -> bytes:
@@ -81,7 +100,7 @@ def create_synthetic_frame(
     # Burn Ring watermark overlay: top-left or bottom-left
     # Ring format: "[Device Name] - [Timestamp] - Ring Developer Playground: simulated streams"
     watermark_text = f"Ring: {device_name} | {ts_str} | Ring Developer Playground: simulated streams"
-    draw.rectangle((5, height - 28, width - 5, height - 6), fill=(0, 0, 0, 180))
+    draw.rectangle((5, height - 28, width - 5, height - 6), fill=(0, 0, 0))
     draw.text((10, height - 24), watermark_text, fill=(255, 255, 255))
 
     return image_to_jpeg(img)
@@ -93,10 +112,12 @@ async def grab_frames(
     n_frames: int = 4,
     token: str | None = None,
     timeout_seconds: float = 10.0,
-) -> list[bytes]:
+) -> list[Frame]:
     """Capture frames from a Ring live-view WHEP endpoint using aiortc.
 
-    Returns a list of JPEG-encoded byte strings.
+    Returns between 1 and ``n_frames`` live frames. Fewer than requested means
+    the stream stalled or errored mid-capture; callers can compare lengths.
+    Raises FrameCaptureError if no frame at all arrived.
     """
     if not AIORTC_AVAILABLE:  # pragma: no cover
         raise FrameCaptureError("aiortc package is required for WHEP frame capture.")
@@ -105,70 +126,82 @@ async def grab_frames(
     pc.addTransceiver("video", direction="recvonly")
 
     session_id_or_url: str | None = None
-    captured_jpegs: list[bytes] = []
-    frame_ready = asyncio.Event()
+    frames: list[Frame] = []
+    errors: list[Exception] = []
+    done = asyncio.Event()
+    tasks: list[asyncio.Task[None]] = []
+
+    async def receive_loop(track: Any) -> None:
+        try:
+            while len(frames) < n_frames:
+                video_frame = await track.recv()
+                frames.append(
+                    Frame(
+                        jpeg=image_to_jpeg(video_frame.to_image()),
+                        source="live",
+                        captured_at=datetime.now(timezone.utc),
+                    )
+                )
+        except Exception as exc:  # track ended or decode failed
+            errors.append(exc)
+        finally:
+            done.set()
 
     try:
         offer = await pc.createOffer()
         await pc.setLocalDescription(offer)
-
         if not pc.localDescription:
             raise FrameCaptureError("Failed to generate local SDP offer.")
 
-        # Post offer to Ring WHEP endpoint
+        @pc.on("track")
+        def on_track(track: Any) -> None:
+            if track.kind == "video":
+                tasks.append(asyncio.create_task(receive_loop(track)))
+
         answer_sdp, session_id_or_url = await client.start_whep(
             device_id=device_id,
             offer_sdp=pc.localDescription.sdp,
             token=token,
         )
-
-        @pc.on("track")
-        def on_track(track: Any) -> None:
-            async def receive_loop() -> None:
-                try:
-                    while len(captured_jpegs) < n_frames:
-                        frame = await track.recv()
-                        # Convert aiortc VideoFrame to PIL Image
-                        pil_img = frame.to_image()
-                        captured_jpegs.append(image_to_jpeg(pil_img))
-                        if len(captured_jpegs) >= n_frames:
-                            frame_ready.set()
-                            break
-                except Exception:
-                    frame_ready.set()
-
-            asyncio.create_task(receive_loop())
-
-        await pc.setRemoteDescription(
-            RTCSessionDescription(sdp=answer_sdp, type="answer")
-        )
+        await pc.setRemoteDescription(RTCSessionDescription(sdp=answer_sdp, type="answer"))
 
         try:
-            await asyncio.wait_for(frame_ready.wait(), timeout=timeout_seconds)
+            await asyncio.wait_for(done.wait(), timeout=timeout_seconds)
         except asyncio.TimeoutError:
-            if not captured_jpegs:
-                raise FrameCaptureError(
-                    f"Timed out after {timeout_seconds}s waiting for WHEP video frames."
-                )
+            pass
 
-        return captured_jpegs
+        if not frames:
+            detail = f": {errors[0]!r}" if errors else ""
+            raise FrameCaptureError(
+                f"No video frames received within {timeout_seconds}s{detail}"
+            )
+        return frames
 
     finally:
-        # Teardown WebRTC peer connection and remote WHEP session
+        for task in tasks:
+            task.cancel()
         try:
             await pc.close()
         except Exception:
             pass
-
         if session_id_or_url:
-            try:
-                await client.stop_whep(
-                    device_id=device_id,
-                    session_id_or_url=session_id_or_url,
-                    token=token,
-                )
-            except Exception:
-                pass
+            await client.stop_whep(
+                device_id=device_id, session_id_or_url=session_id_or_url, token=token
+            )
+
+
+def synthetic_frames(
+    n_frames: int, has_parcel: bool, watermark_ts: datetime | None
+) -> list[Frame]:
+    ts = watermark_ts or datetime.now(timezone.utc)
+    return [
+        Frame(
+            jpeg=create_synthetic_frame(has_parcel=has_parcel, watermark_time=ts),
+            source="synthetic",
+            captured_at=ts,
+        )
+        for _ in range(n_frames)
+    ]
 
 
 async def get_camera_frames(
@@ -176,29 +209,27 @@ async def get_camera_frames(
     device_id: str,
     n_frames: int = 4,
     token: str | None = None,
-    use_synthetic_fallback: bool = False,
+    force_synthetic: bool = False,
+    fallback_to_synthetic: bool = False,
     synthetic_has_parcel: bool = True,
     synthetic_watermark_ts: datetime | None = None,
-) -> list[bytes]:
-    """Acquire camera frames with optional synthetic fallback for offline simulation."""
-    if use_synthetic_fallback or os.environ.get("COUNTERSIGN_OFFLINE_SIMULATION") == "true":
-        return [
-            create_synthetic_frame(
-                has_parcel=synthetic_has_parcel,
-                watermark_time=synthetic_watermark_ts or datetime.now(timezone.utc),
-            )
-            for _ in range(n_frames)
-        ]
+) -> list[Frame]:
+    """Acquire camera frames.
 
+    ``force_synthetic`` (or ``COUNTERSIGN_OFFLINE_SIMULATION=true``) skips the
+    camera entirely; ``fallback_to_synthetic`` substitutes synthetic frames if
+    live capture fails. Synthetic frames are always tagged ``source="synthetic"``
+    so the policy and approval layers can refuse to act on them.
+    """
+
+    def fake() -> list[Frame]:
+        return synthetic_frames(n_frames, synthetic_has_parcel, synthetic_watermark_ts)
+
+    if force_synthetic or os.environ.get(OFFLINE_ENV) == "true":
+        return fake()
     try:
         return await grab_frames(client, device_id, n_frames=n_frames, token=token)
     except Exception as exc:
-        if use_synthetic_fallback:
-            return [
-                create_synthetic_frame(
-                    has_parcel=synthetic_has_parcel,
-                    watermark_time=synthetic_watermark_ts or datetime.now(timezone.utc),
-                )
-                for _ in range(n_frames)
-            ]
+        if fallback_to_synthetic:
+            return fake()
         raise FrameCaptureError(f"Failed to acquire live camera frames: {exc}") from exc
