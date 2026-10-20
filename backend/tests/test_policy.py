@@ -84,3 +84,42 @@ def test_pre_delivery_negatives_do_not_dispute():
 def test_custom_config():
     cfg = PolicyConfig(min_negative_frames=1)
     assert decide([obs(False)], T0, cfg).verdict is Verdict.DISPUTED
+
+
+def synth(**kw):
+    o = obs(**kw)
+    return Observation(o.parcel_visible, o.confidence, o.location, o.watermark_ts, source="synthetic")
+
+
+def test_synthetic_frames_excluded_by_default():
+    d = decide([synth()], T0)
+    assert d.verdict is Verdict.INCONCLUSIVE
+    assert d.excluded_synthetic == 1
+    assert not d.synthetic
+    assert "synthetic" in d.reason
+
+
+def test_synthetic_opt_in_is_flagged():
+    d = decide([synth()], T0, PolicyConfig(allow_synthetic=True))
+    assert d.verdict is Verdict.VERIFIED
+    assert d.synthetic
+
+
+def test_live_frame_beside_synthetic_ignores_synthetic():
+    d = decide([synth(visible=False), obs()], T0)
+    assert d.verdict is Verdict.VERIFIED
+    assert not d.synthetic
+
+
+def test_unusable_timestamps_counted_and_explained():
+    naive = Observation(True, 0.99, "porch", datetime(2026, 10, 15, 12, 1))
+    missing = Observation(True, 0.99, "porch", None)
+    d = decide([naive, missing], T0)
+    assert d.verdict is Verdict.INCONCLUSIVE
+    assert d.unusable_timestamps == 2
+    assert "unusable watermark" in d.reason
+
+
+def test_negative_exactly_at_delivery_time_counts():
+    d = decide([obs(False, dt=timedelta(0)), obs(False, dt=timedelta(0))], T0)
+    assert d.verdict is Verdict.DISPUTED

@@ -9,6 +9,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
+from typing import Literal
+
+
+Source = Literal["live", "synthetic", "replay"]
 
 
 class Verdict(str, Enum):
@@ -29,6 +33,10 @@ class Observation:
     confidence: float  # 0.0-1.0, as reported by the judge
     location: str | None = None  # e.g. "step", "porch"
     watermark_ts: datetime | None = None
+    # "live" frames come from a real camera stream. "synthetic" frames are
+    # generated for offline simulation and must never back a real claim.
+    source: Source = "live"
+    frame_id: str | None = None  # content hash, ties the verdict to evidence
 
 
 @dataclass(frozen=True)
@@ -39,6 +47,9 @@ class PolicyConfig:
     window_before: timedelta = timedelta(minutes=5)
     window_after: timedelta = timedelta(minutes=30)
     allowed_locations: frozenset[str] = frozenset({"step", "porch"})
+    # Synthetic frames are ignored unless a demo explicitly opts in. Even then
+    # the Decision is flagged ``synthetic`` and the approval layer refuses it.
+    allow_synthetic: bool = False
 
 
 @dataclass(frozen=True)
@@ -49,6 +60,9 @@ class Decision:
     negative_frames: int
     considered_frames: int
     requires_approval: bool = True  # claims drafting always needs a human
+    synthetic: bool = False  # any considered frame was synthetic
+    excluded_synthetic: int = 0  # synthetic frames dropped by config
+    unusable_timestamps: int = 0  # frames with a missing/naive watermark
 
 
 def decide(
@@ -67,9 +81,22 @@ def decide(
     start = delivered_at - config.window_before
     end = delivered_at + config.window_after
 
+    excluded_synthetic = 0
+    usable: list[Observation] = []
+    for o in observations:
+        if o.source == "synthetic" and not config.allow_synthetic:
+            excluded_synthetic += 1
+        else:
+            usable.append(o)
+    unusable_ts = sum(
+        1
+        for o in usable
+        if o.watermark_ts is None or not _comparable(o.watermark_ts, delivered_at)
+    )
+
     in_window = [
         o
-        for o in observations
+        for o in usable
         if o.watermark_ts is not None
         and _comparable(o.watermark_ts, delivered_at)
         and start <= o.watermark_ts <= end
@@ -92,11 +119,30 @@ def decide(
     ]
     n_pos, n_neg, n_all = len(positive), len(negative), len(confident)
 
+    synthetic = any(o.source == "synthetic" for o in confident)
+
     def result(verdict: Verdict, reason: str) -> Decision:
-        return Decision(verdict, reason, n_pos, n_neg, n_all)
+        return Decision(
+            verdict,
+            reason,
+            n_pos,
+            n_neg,
+            n_all,
+            synthetic=synthetic,
+            excluded_synthetic=excluded_synthetic,
+            unusable_timestamps=unusable_ts,
+        )
 
     if n_all == 0:
-        return result(Verdict.INCONCLUSIVE, "no confident frames in delivery window")
+        notes = []
+        if unusable_ts:
+            notes.append(f"{unusable_ts} with missing/unusable watermark")
+        if excluded_synthetic:
+            notes.append(f"{excluded_synthetic} synthetic excluded")
+        suffix = f" ({', '.join(notes)})" if notes else ""
+        return result(
+            Verdict.INCONCLUSIVE, f"no confident frames in delivery window{suffix}"
+        )
     if n_pos and n_neg:
         return result(Verdict.INCONCLUSIVE, "confident frames conflict")
     if n_pos >= config.min_positive_frames:
