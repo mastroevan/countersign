@@ -10,8 +10,7 @@ dependencies = [
     "pydantic>=2.7",
     "pillow>=10",
     "aiortc>=1.9",
-    "easypost",
-    "mcp",
+    "fastmcp>=4",
 ]
 
 [project.optional-dependencies]
