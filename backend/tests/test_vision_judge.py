@@ -79,7 +79,28 @@ def test_judge_frame_request_shape():
     assert call["messages"][0]["content"][0]["image"]["source"]["bytes"] == b"img"
 
 
+def test_parses_human_watermark_timestamp():
+    o = parse_response(
+        resp(
+            parcel_visible=True,
+            location="porch",
+            confidence=0.9,
+            watermark_timestamp="10/15/2026 12:01:00 PM",
+        )
+    )
+    assert o.watermark_ts == datetime(2026, 10, 15, 12, 1, tzinfo=timezone.utc)
+
+
 def test_requires_model_id(monkeypatch):
+    monkeypatch.delenv("BEDROCK_MODEL_ID", raising=False)
     monkeypatch.delenv("COUNTERSIGN_BEDROCK_MODEL_ID", raising=False)
     with pytest.raises(VisionJudgeError):
         judge_frame(StubClient({}), b"img")
+
+
+def test_reads_bedrock_model_id_from_env(monkeypatch):
+    monkeypatch.setenv("BEDROCK_MODEL_ID", "model-via-bedrock-env")
+    monkeypatch.delenv("COUNTERSIGN_BEDROCK_MODEL_ID", raising=False)
+    client = StubClient(resp(parcel_visible=True, location="step", confidence=0.8))
+    judge_frame(client, b"img")
+    assert client.calls[0]["modelId"] == "model-via-bedrock-env"
