@@ -127,3 +127,67 @@ def test_missing_token_raises():
     client = RingClient(token="")
     with pytest.raises(RingClientError):
         client._get_headers()
+
+
+def _doc(attrs, included=None, rel=None):
+    dev = {"id": "d1", "type": "device", "attributes": attrs}
+    if rel:
+        dev["relationships"] = rel
+    doc = {"data": [dev]}
+    if included:
+        doc["included"] = included
+    return doc
+
+
+async def _find(doc):
+    transport = httpx.MockTransport(lambda r: httpx.Response(200, json=doc))
+    async with httpx.AsyncClient(transport=transport) as http:
+        return await RingClient(token="t", http_client=http).find_door_device()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "attrs",
+    [
+        {"status": {"online": True}},  # no configuration at all
+        {"configuration": {}, "status": {"online": True}},  # no e2e key
+        {"configuration": {"e2e_encryption": {}}},  # enabled missing
+        {"configuration": {"e2e_encryption": {"enabled": None}}},
+    ],
+)
+async def test_unknown_e2e_status_fails_closed(attrs):
+    with pytest.raises(RingDeviceInaccessibleError):
+        await _find(_doc(attrs))
+
+
+@pytest.mark.asyncio
+async def test_included_configuration_enabled_is_rejected():
+    doc = _doc(
+        {"configuration": {"e2e_encryption": {"enabled": False}}},
+        included=[
+            {"type": "configuration", "id": "c1", "attributes": {"e2e_encryption": {"enabled": True}}}
+        ],
+        rel={"configurations": {"data": {"type": "configuration", "id": "c1"}}},
+    )
+    with pytest.raises(RingDeviceInaccessibleError):
+        await _find(doc)
+
+
+@pytest.mark.asyncio
+async def test_included_configuration_disabled_is_accepted():
+    doc = _doc(
+        {},
+        included=[
+            {"type": "configuration", "id": "c1", "attributes": {"e2e_encryption": {"enabled": False}}}
+        ],
+        rel={"configurations": {"data": {"type": "configuration", "id": "c1"}}},
+    )
+    assert (await _find(doc))["id"] == "d1"
+
+
+@pytest.mark.asyncio
+async def test_stop_whep_never_raises_on_api_error():
+    transport = httpx.MockTransport(lambda r: httpx.Response(500, text="boom"))
+    async with httpx.AsyncClient(transport=transport) as http:
+        client = RingClient(token="t", http_client=http)
+        await client.stop_whep("d1", "sess-1")  # must not raise
