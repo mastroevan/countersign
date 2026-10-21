@@ -1,24 +1,30 @@
 """Verification service shared by the HTTP API and the MCP server.
 
 All rules about what may happen (synthetic evidence is refused, claims only
-for DISPUTED verdicts, actions need a recorded human approval) live here so
-the two front doors cannot drift apart.
+for DISPUTED verdicts after a re-check, actions need a recorded human
+approval) live here so the two front doors cannot drift apart.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 from collections.abc import Awaitable, Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from countersign.evidence import EvidenceSink, S3Sink, draft_claim
+from countersign.evidence import EvidenceSink, PacketRef, S3Sink, draft_claim
 from countersign.ledger import ACTIONS, Action, Approval, Ledger, Verification
-from countersign.pipeline import VerificationResult
+from countersign.pipeline import VerificationResult, combine_results
 from countersign.policy import Verdict
+from countersign.trackers import EasyPostTrackers, TrackerLookup
 
 log = logging.getLogger("countersign")
 
 Verifier = Callable[[datetime, bool], Awaitable[VerificationResult]]
+
+RECHECK_DELAY_ENV = "RECHECK_DELAY_S"
+DEFAULT_RECHECK_DELAY_S = 600.0  # 10 minutes; set RECHECK_DELAY_S=60 for demos
 
 
 class ServiceError(Exception):
@@ -36,10 +42,22 @@ class VerificationService:
         verifier: Verifier,
         ledger: Ledger | None = None,
         sink: EvidenceSink | None = None,
+        trackers: TrackerLookup | None = None,
+        recheck_delay_s: float | None = None,
     ) -> None:
         self.verifier = verifier
         self.ledger = ledger or Ledger()
         self._sink = sink
+        self.trackers: TrackerLookup = trackers or EasyPostTrackers()
+        self.recheck_delay_s = (
+            recheck_delay_s
+            if recheck_delay_s is not None
+            else float(os.environ.get(RECHECK_DELAY_ENV, DEFAULT_RECHECK_DELAY_S))
+        )
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._timers: set[asyncio.Future[None]] = set()
+
+    # -- creation and capture ------------------------------------------------
 
     def start(
         self,
@@ -59,15 +77,74 @@ class VerificationService:
         )
 
     async def run(self, vid: str) -> Verification:
+        """First capture run. A DISPUTED result schedules a re-check."""
         v = self.get(vid)
         try:
             v.result = await self.verifier(v.delivered_at, v.simulate)
             v.status = "complete"
+            v.runs = 1
+            v.checked_at = datetime.now(timezone.utc)
+            self._schedule_recheck(v)
         except Exception as exc:
             log.exception("verification %s failed", vid)
             v.error = f"{type(exc).__name__}: {exc}"
             v.status = "failed"
         return v
+
+    async def recheck(self, vid: str) -> Verification:
+        """Capture again and re-run the policy over all frames so far.
+
+        Safe to call at any time (the timer, or an agent via ``recheck_door``).
+        A failed capture is recorded and leaves the verdict provisional.
+        """
+        async with self._locks.setdefault(vid, asyncio.Lock()):
+            v = self.get(vid)
+            if v.status != "complete" or v.result is None:
+                raise ServiceError(409, f"verification is {v.status}, not complete")
+            try:
+                new = await self.verifier(v.delivered_at, v.simulate)
+            except Exception as exc:
+                log.exception("re-check of %s failed", vid)
+                v.recheck_error = f"{type(exc).__name__}: {exc}"
+                return v
+            v.result = combine_results(v.result, new)
+            v.runs += 1
+            v.checked_at = datetime.now(timezone.utc)
+            v.recheck_state = "done"
+            v.recheck_due_at = None
+            v.recheck_error = None
+            # Approvals covered the earlier evidence; new frames need a fresh look.
+            v.approvals.clear()
+            v.claim_draft = v.evidence_location = v.evidence_sha256 = None
+            return v
+
+    def _schedule_recheck(self, v: Verification) -> None:
+        assert v.result is not None
+        if v.result.decision.verdict is not Verdict.DISPUTED or v.synthetic:
+            return
+        if v.recheck_state != "none":
+            return
+        v.recheck_state = "scheduled"
+        v.recheck_due_at = datetime.now(timezone.utc) + timedelta(seconds=self.recheck_delay_s)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # no loop (sync caller): the state stays "scheduled"
+            return
+
+        def fire() -> None:
+            fut = asyncio.ensure_future(self._timed_recheck(v.id))
+            self._timers.add(fut)
+            fut.add_done_callback(self._timers.discard)
+
+        loop.call_later(self.recheck_delay_s, fire)
+
+    async def _timed_recheck(self, vid: str) -> None:
+        try:
+            await self.recheck(vid)
+        except Exception:
+            log.exception("scheduled re-check of %s failed", vid)
+
+    # -- lookups ---------------------------------------------------------------
 
     def get(self, vid: str) -> Verification:
         v = self.ledger.get(vid)
@@ -75,8 +152,35 @@ class VerificationService:
             raise ServiceError(404, "verification not found")
         return v
 
-    def list(self) -> list[Verification]:
-        return self.ledger.list()
+    def list(self, since: datetime | None = None) -> list[Verification]:
+        return self.ledger.list(since)
+
+    async def verify_tracking_code(
+        self, tracking_code: str, carrier: str | None = None
+    ) -> Verification | None:
+        """Verification for a tracking code, reusing an existing one.
+
+        Returns None when no carrier "delivered" scan is known yet (PENDING).
+        """
+        existing = self.ledger.find_by_tracking_code(tracking_code)
+        if existing is not None and existing.status in ("complete", "pending"):
+            return existing
+        when = await self.trackers.delivered_at(tracking_code, carrier)
+        if when is None:
+            return None
+        v, _ = self.start(source="mcp", delivered_at=when, tracking_code=tracking_code)
+        await self.run(v.id)
+        return v
+
+    async def recheck_tracking_code(self, tracking_code: str) -> Verification:
+        v = self.ledger.find_by_tracking_code(tracking_code)
+        if v is None:
+            raise ServiceError(404, f"no verification for tracking code {tracking_code}")
+        if v.status == "failed":
+            return await self.run(v.id)  # nothing to merge into yet
+        return await self.recheck(v.id)
+
+    # -- approval-gated actions -----------------------------------------------
 
     def record_approval(
         self, vid: str, action: Action, approved: bool, approver: str
@@ -98,15 +202,34 @@ class VerificationService:
             v.claim_draft = draft_claim(v)
         return v.claim_draft
 
-    async def evidence_packet(self, vid: str) -> str:
+    async def evidence_packet(self, vid: str) -> PacketRef:
         v = self.get(vid)
         _require_actionable(v, "evidence_packet")
         _require_approved(v, "evidence_packet")
-        if v.evidence_location is None:
+        if v.evidence_location is None or v.evidence_sha256 is None:
             if self._sink is None:
                 self._sink = S3Sink()
-            v.evidence_location = await self._sink.put_packet(v)
-        return v.evidence_location
+            ref = await self._sink.put_packet(v)
+            v.evidence_location, v.evidence_sha256 = ref.location, ref.sha256
+        return PacketRef(v.evidence_location, v.evidence_sha256)
+
+    async def claim_packet(self, vid: str) -> dict[str, Any]:
+        """Packet + claim draft together. Checks BOTH gates before doing either,
+        so a missing approval never leaves a half-built result."""
+        v = self.get(vid)
+        for action in ACTIONS:
+            _require_actionable(v, action)
+        for action in ACTIONS:
+            _require_approved(v, action)
+        draft = self.claim_draft(vid)
+        ref = await self.evidence_packet(vid)
+        return {
+            "verification_id": vid,
+            "packet_url": ref.location,
+            "sha256": ref.sha256,
+            "draft_text": draft["draft_text"],
+            "requires_approval": True,  # a human still reviews and sends the claim
+        }
 
 
 def _require_actionable(v: Verification, action: Action) -> None:
@@ -117,7 +240,15 @@ def _require_actionable(v: Verification, action: Action) -> None:
         raise ServiceError(409, f"verification is {v.status}, not complete")
     if v.synthetic:
         raise ServiceError(409, "synthetic/simulated evidence can never back a claim or packet")
-    if action == "claim_draft" and v.result.decision.verdict is not Verdict.DISPUTED:
+    verdict = v.result.decision.verdict
+    if verdict is Verdict.DISPUTED and v.recheck_state != "done":
+        due = v.recheck_due_at.isoformat() if v.recheck_due_at else "soon"
+        raise ServiceError(
+            409,
+            f"DISPUTED is provisional until the re-check runs (due {due}); "
+            "claims and packets wait for it",
+        )
+    if action == "claim_draft" and verdict is not Verdict.DISPUTED:
         raise ServiceError(409, "claims can only be drafted for DISPUTED verdicts")
 
 
