@@ -7,12 +7,13 @@ verdict always comes from ``policy.decide``.
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, tzinfo
 from typing import Any
 
-from countersign.frames import Frame, get_camera_frames
+from countersign.frames import OFFLINE_ENV, Frame, get_camera_frames
 from countersign.policy import Decision, Observation, PolicyConfig, decide
 from countersign.ring_client import RingClient
 from countersign.vision_judge import VisionJudgeError, judge_frame
@@ -107,6 +108,7 @@ async def verify_delivery(
     explicitly false (``find_door_device`` fails closed) before a WHEP session
     is opened. Synthetic path skips the Ring API entirely.
     """
+    force_synthetic = force_synthetic or os.environ.get(OFFLINE_ENV) == "true"
     if force_synthetic:
         resolved_id = SIMULATED_DEVICE_ID
     else:

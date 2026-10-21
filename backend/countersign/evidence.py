@@ -11,6 +11,7 @@ import json
 import os
 from typing import Any, Protocol
 
+from countersign.aws import make_client
 from countersign.ledger import Verification
 
 S3_BUCKET_ENV = "COUNTERSIGN_EVIDENCE_BUCKET"
@@ -72,9 +73,7 @@ class S3Sink:
         if not self.bucket:
             raise RuntimeError(f"set {S3_BUCKET_ENV} to store evidence packets in S3")
         if client is None:
-            import boto3
-
-            client = boto3.client("s3")
+            client = make_client("s3")
         self.client = client
 
     async def put_packet(self, v: Verification) -> str:
