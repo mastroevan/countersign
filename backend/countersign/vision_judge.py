@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import hashlib
 import os
+import time
 from dataclasses import replace
 from datetime import datetime, timezone, tzinfo
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from countersign import trace
 from countersign.policy import Observation, Source
 
 DEFAULT_MODEL_ID_ENV = "BEDROCK_MODEL_ID"
@@ -98,7 +100,31 @@ def judge_frame(
             f"set {DEFAULT_MODEL_ID_ENV} (or {LEGACY_MODEL_ID_ENV}) or pass model_id"
         )
 
-    response = client.converse(
+    frame_id = hashlib.sha256(image_bytes).hexdigest()[:16]
+    started = time.perf_counter()
+    try:
+        response = _converse(client, model, image_bytes, image_format)
+    except Exception as exc:
+        trace.emit(
+            "bedrock_call", "error", model_id=model, frame_id=frame_id,
+            latency_ms=round((time.perf_counter() - started) * 1000),
+            error=f"{type(exc).__name__}: {exc}",
+        )
+        raise
+    meta = response.get("ResponseMetadata") or {}
+    usage = response.get("usage") or {}
+    trace.emit(
+        "bedrock_call", "ok", model_id=model, frame_id=frame_id,
+        latency_ms=round((time.perf_counter() - started) * 1000),
+        request_id=meta.get("RequestId"),
+        input_tokens=usage.get("inputTokens"), output_tokens=usage.get("outputTokens"),
+    )
+    obs = parse_response(response, device_tz=device_tz or device_tz_from_env())
+    return replace(obs, source=source, frame_id=frame_id)
+
+
+def _converse(client: Any, model: str, image_bytes: bytes, image_format: str) -> dict[str, Any]:
+    response: dict[str, Any] = client.converse(
         modelId=model,
         system=[{"text": SYSTEM_PROMPT}],
         messages=[
@@ -113,12 +139,7 @@ def judge_frame(
         toolConfig=TOOL_CONFIG,
         inferenceConfig={"temperature": 0, "maxTokens": 300},
     )
-    obs = parse_response(response, device_tz=device_tz or device_tz_from_env())
-    return replace(
-        obs,
-        source=source,
-        frame_id=hashlib.sha256(image_bytes).hexdigest()[:16],
-    )
+    return response
 
 
 def device_tz_from_env() -> tzinfo | None:
