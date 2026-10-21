@@ -35,6 +35,7 @@ class Verification:
     created_at: datetime
     delivered_at: datetime
     tracking_code: str | None = None
+    tracker_id: str | None = None
     event_id: str | None = None
     simulate: bool = False
     result: VerificationResult | None = None
@@ -65,6 +66,7 @@ class Verification:
             "created_at": self.created_at.isoformat(),
             "delivered_at": self.delivered_at.isoformat(),
             "tracking_code": self.tracking_code,
+            "tracker_id": self.tracker_id,
             "event_id": self.event_id,
             "simulate": self.simulate,
             "synthetic": self.synthetic,
@@ -102,6 +104,7 @@ class Ledger:
         source: str,
         delivered_at: datetime,
         tracking_code: str | None = None,
+        tracker_id: str | None = None,
         event_id: str | None = None,
         simulate: bool = False,
     ) -> tuple[Verification, bool]:
@@ -117,6 +120,7 @@ class Ledger:
                 created_at=datetime.now(timezone.utc),
                 delivered_at=delivered_at,
                 tracking_code=tracking_code,
+                tracker_id=tracker_id,
                 event_id=event_id,
                 simulate=simulate,
             )

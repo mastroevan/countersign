@@ -78,9 +78,12 @@ async def test_encrypted_device_blocks_capture():
         called = True
         return []
 
-    with pytest.raises(RingDeviceInaccessibleError):
-        await verify_delivery(T0, ring_with([ENC_DEV]), Bedrock(), frames_fn=fn)
+    res = await verify_delivery(T0, ring_with([ENC_DEV]), Bedrock(), frames_fn=fn)
     assert not called, "WHEP must not open for an encrypted device"
+    # No usable camera is INCONCLUSIVE with a plain reason, not an error or a verdict on the parcel.
+    assert res.decision.verdict is Verdict.INCONCLUSIVE
+    assert res.decision.rule == "camera_unavailable"
+    assert "encrypted" in res.decision.reason and res.frames == []
 
 
 @pytest.mark.asyncio
@@ -160,3 +163,26 @@ async def test_offline_env_skips_ring_in_pipeline(monkeypatch):
     )
     assert res.device_id == "simulated"
     assert [f.source for f in res.frames] == ["synthetic"]
+
+
+@pytest.mark.asyncio
+async def test_capture_timeout_is_inconclusive():
+    from countersign.frames import FrameCaptureError
+
+    async def timeout(*a, **k):
+        raise FrameCaptureError("No video frames received within 10s")
+
+    res = await verify_delivery(T0, ring_with([GOOD_DEV]), Bedrock(), frames_fn=timeout)
+    assert res.decision.verdict is Verdict.INCONCLUSIVE
+    assert res.device_id == "d1"  # found the camera, then no frames arrived
+    assert "No video frames" in res.decision.reason
+
+
+@pytest.mark.asyncio
+async def test_expired_token_stays_an_error_not_a_verdict():
+    from countersign.ring_client import RingTokenExpiredError
+
+    transport = httpx.MockTransport(lambda r: httpx.Response(401))
+    ring = RingClient(token="t", http_client=httpx.AsyncClient(transport=transport))
+    with pytest.raises(RingTokenExpiredError):
+        await verify_delivery(T0, ring, Bedrock(), frames_fn=frames_fn([]))

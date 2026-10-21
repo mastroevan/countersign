@@ -38,13 +38,16 @@ async def test_timer_fires_recheck_after_delay():
 
 
 @pytest.mark.asyncio
-async def test_verified_and_synthetic_never_schedule_a_recheck():
+async def test_verified_never_schedules_and_simulated_dispute_does_but_stays_unclaimable():
     s = service(True)
     v = await disputed(s)
     assert v.recheck_state == "none"
     s2 = service(False, source="synthetic")
     v2 = await disputed(s2)
-    assert v2.recheck_state == "none"
+    assert v2.recheck_state == "scheduled"  # demos can show the re-check
+    await s2.recheck(v2.id)
+    with pytest.raises(ServiceError, match="synthetic"):
+        await s2.claim_packet(v2.id)
 
 
 @pytest.mark.asyncio
@@ -52,11 +55,11 @@ async def test_failed_recheck_keeps_verdict_provisional_and_is_retryable():
     calls = {"n": 0}
     good = make_verifier(False)
 
-    async def flaky(delivered_at, simulate):
+    async def flaky(delivered_at, simulate, binding=None):
         calls["n"] += 1
         if calls["n"] == 2:
             raise RuntimeError("ring 503")
-        return await good(delivered_at, simulate)
+        return await good(delivered_at, simulate, binding)
 
     s = VerificationService(flaky, Ledger(), MemorySink(), recheck_delay_s=3600)
     v = await disputed(s)

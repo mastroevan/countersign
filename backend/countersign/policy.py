@@ -66,6 +66,8 @@ class Decision:
     # Lowest confidence among the frames that back the verdict (conservative);
     # None for INCONCLUSIVE, which has no backing frames.
     confidence: float | None = None
+    # Stable id of the policy rule that fired, shown in the trace and ledger.
+    rule: str = ""
 
 
 def decide(
@@ -124,7 +126,7 @@ def decide(
 
     synthetic = any(o.source == "synthetic" for o in confident)
 
-    def result(verdict: Verdict, reason: str) -> Decision:
+    def result(verdict: Verdict, reason: str, rule: str) -> Decision:
         basis = positive if verdict is Verdict.VERIFIED else negative
         conf = (
             min(o.confidence for o in basis)
@@ -141,6 +143,7 @@ def decide(
             excluded_synthetic=excluded_synthetic,
             unusable_timestamps=unusable_ts,
             confidence=conf,
+            rule=rule,
         )
 
     if n_all == 0:
@@ -151,14 +154,16 @@ def decide(
             notes.append(f"{excluded_synthetic} synthetic excluded")
         suffix = f" ({', '.join(notes)})" if notes else ""
         return result(
-            Verdict.INCONCLUSIVE, f"no confident frames in delivery window{suffix}"
+            Verdict.INCONCLUSIVE,
+            f"no confident frames in delivery window{suffix}",
+            "no_confident_frames",
         )
     if n_pos and n_neg:
-        return result(Verdict.INCONCLUSIVE, "confident frames conflict")
+        return result(Verdict.INCONCLUSIVE, "confident frames conflict", "conflicting_frames")
     if n_pos >= config.min_positive_frames:
-        return result(Verdict.VERIFIED, "parcel confidently visible in window")
+        return result(Verdict.VERIFIED, "parcel confidently visible in window", "parcel_visible")
     if n_neg >= config.min_negative_frames:
-        return result(Verdict.DISPUTED, "parcel confidently absent in window")
+        return result(Verdict.DISPUTED, "parcel confidently absent in window", "parcel_absent_after_scan")
 
     disallowed_locations = [
         o
@@ -170,11 +175,28 @@ def decide(
         return result(
             Verdict.INCONCLUSIVE,
             f"parcel visible outside allowed delivery area ({locs})",
+            "parcel_outside_delivery_area",
         )
 
-    return result(Verdict.INCONCLUSIVE, "insufficient confident evidence")
+    return result(Verdict.INCONCLUSIVE, "insufficient confident evidence", "insufficient_evidence")
 
 
 def _comparable(a: datetime, b: datetime) -> bool:
     """Naive and aware datetimes cannot be compared; treat mixes as unusable."""
     return (a.tzinfo is None) == (b.tzinfo is None)
+
+
+def camera_unavailable(reason: str) -> Decision:
+    """INCONCLUSIVE for a camera that is offline, encrypted, or yields no frames.
+
+    Absence of a picture is never evidence about the parcel. (An expired token
+    is different: it is raised as an error, not turned into a verdict.)
+    """
+    return Decision(
+        Verdict.INCONCLUSIVE,
+        f"camera unavailable: {reason}",
+        positive_frames=0,
+        negative_frames=0,
+        considered_frames=0,
+        rule="camera_unavailable",
+    )
