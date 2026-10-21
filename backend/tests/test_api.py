@@ -16,20 +16,27 @@ from countersign.policy import Observation, decide
 T0 = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
 
 
-def make_verifier(visible: bool, source: str = "live", n: int = 2):
+def make_verifier(visible, source: str = "live", n: int = 2):
+    """``visible`` may be a bool, or a list giving the outcome of each successive call."""
+    calls = {"n": 0}
+
     async def run(delivered_at, simulate):
+        k = calls["n"]
+        calls["n"] += 1
+        vis = visible[min(k, len(visible) - 1)] if isinstance(visible, list) else visible
         frames, evidence, obs = [], [], []
         for i in range(n):
-            ts = delivered_at + timedelta(minutes=1, seconds=i)
-            f = Frame(f"jpeg-{i}".encode(), source, ts)  # type: ignore[arg-type]
-            o = Observation(visible, 0.95, "porch", ts, source=source)  # type: ignore[arg-type]
+            ts = delivered_at + timedelta(minutes=1 + 2 * k, seconds=i)
+            f = Frame(f"jpeg-{k}-{i}".encode(), source, ts)  # type: ignore[arg-type]
+            o = Observation(vis, 0.95, "porch", ts, source=source)  # type: ignore[arg-type]
             frames.append(f)
             obs.append(o)
             evidence.append(FrameEvidence(f.frame_id, source, ts, o))
         from countersign.policy import PolicyConfig
 
-        d = decide(obs, delivered_at, PolicyConfig(allow_synthetic=True))
-        return VerificationResult(d, delivered_at, "d1", evidence, frames, n)
+        cfg = PolicyConfig(allow_synthetic=True)
+        d = decide(obs, delivered_at, cfg)
+        return VerificationResult(d, delivered_at, "d1", evidence, frames, n, cfg)
 
     return run
 
@@ -41,8 +48,10 @@ def boom_verifier():
     return run
 
 
-def client(verifier, sink=None):
-    return TestClient(create_app(verifier=verifier, ledger=Ledger(), sink=sink or MemorySink()))
+def client(verifier, sink=None, **kw):
+    return TestClient(
+        create_app(verifier=verifier, ledger=Ledger(), sink=sink or MemorySink(), **kw)
+    )
 
 
 def event(status="delivered", event_id="evt_1", dt="2026-10-15T12:00:00Z"):
@@ -131,6 +140,7 @@ def approve(c, vid, action, approved=True, approver="Evan"):
 def test_claim_draft_requires_approval_then_works_for_disputed():
     c = client(make_verifier(False))
     vid = verify(c)
+    assert c.post(f"/verifications/{vid}/recheck").status_code == 200
     r = c.post(f"/verifications/{vid}/claim-draft")
     assert r.status_code == 409 and r.json()["detail"]["error"] == "approval_required"
 
@@ -142,6 +152,7 @@ def test_claim_draft_requires_approval_then_works_for_disputed():
     assert draft.status_code == 200
     assert draft.json()["requires_approval"] is True
     assert draft.json()["carrier_delivered_at"] == T0.isoformat()
+    assert "Tracking number" in draft.json()["draft_text"]
     # idempotent
     assert c.post(f"/verifications/{vid}/claim-draft").json() == draft.json()
 
@@ -162,9 +173,10 @@ def test_evidence_packet_gated_and_preserves_frames():
     approve(c, vid, "evidence_packet")
     r = c.post(f"/verifications/{vid}/evidence-packet")
     assert r.status_code == 200 and r.json()["location"].endswith(vid)
+    assert len(r.json()["sha256"]) == 64
     files = sink.packets[vid]
     assert "manifest.json" in files
-    assert b"jpeg-0" in files.values()  # frame bytes stored unmodified
+    assert b"jpeg-0-0" in files.values()  # frame bytes stored unmodified
     # a second call does not re-upload
     sink.packets.clear()
     c.post(f"/verifications/{vid}/evidence-packet")
@@ -203,3 +215,29 @@ def test_blank_approver_rejected():
     vid = verify(c)
     assert approve(c, vid, "evidence_packet", approver="").status_code == 422
     assert approve(c, vid, "evidence_packet", approver="   ").status_code == 422
+
+
+def test_default_verifier_simulate_reaches_a_verdict_but_never_actionable(monkeypatch):
+    """Regression: simulate=True used PolicyConfig() and was always INCONCLUSIVE."""
+    import countersign.main as main_mod
+    from countersign.vision_judge import TOOL_NAME
+
+    class StubBedrock:
+        def converse(self, **kw):
+            ts = (T0 + timedelta(minutes=1)).isoformat()
+            inp = {
+                "parcel_visible": True,
+                "confidence": 0.95,
+                "location": "porch",
+                "watermark_timestamp": ts,
+            }
+            return {"output": {"message": {"content": [{"toolUse": {"name": TOOL_NAME, "input": inp}}]}}}
+
+    monkeypatch.setenv("BEDROCK_MODEL_ID", "m")
+    monkeypatch.setattr(main_mod, "make_client", lambda service: StubBedrock())
+    c = TestClient(create_app(ledger=Ledger(), sink=MemorySink()))  # real default verifier
+    vid = c.post("/verify", json={"delivered_at": T0.isoformat(), "simulate": True}).json()["id"]
+    body = c.get(f"/verifications/{vid}").json()
+    assert body["result"]["verdict"] == "VERIFIED"
+    assert body["synthetic"] is True and body["result"]["synthetic"] is True
+    assert approve(c, vid, "evidence_packet").status_code == 409

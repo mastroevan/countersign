@@ -146,3 +146,17 @@ async def test_partial_capture_flagged():
         frames_fn=frames_fn([live(now)]), n_frames=4,
     )
     assert res.partial_capture and res.to_dict()["partial_capture"]
+
+
+@pytest.mark.asyncio
+async def test_offline_env_skips_ring_in_pipeline(monkeypatch):
+    monkeypatch.setenv("COUNTERSIGN_OFFLINE_SIMULATION", "true")
+    res = await verify_delivery(
+        T0,
+        RingClient(token=""),  # a Ring call would raise
+        Bedrock(tool_resp(ts=T0 + timedelta(minutes=1))),
+        n_frames=1,
+        config=PolicyConfig(allow_synthetic=True),
+    )
+    assert res.device_id == "simulated"
+    assert [f.source for f in res.frames] == ["synthetic"]
