@@ -21,31 +21,39 @@ from datetime import datetime
 from typing import Any, AsyncIterator, Literal
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import AwareDatetime, BaseModel, Field
 
 from countersign.aws import make_client
 from countersign.evidence import EvidenceSink
-from countersign.frames import OFFLINE_ENV
+from countersign.bindings import SCENARIOS_ENV, StreamBinding
+from countersign.frames import OFFLINE_ENV, forced_timeout_frames
 from countersign.ledger import Ledger
 from countersign.mcp_server import build_mcp
 from countersign.pipeline import VerificationResult, verify_delivery
 from countersign.policy import PolicyConfig
 from countersign.ring_client import RingClient
 from countersign.trackers import TrackerLookup, delivered_at_from_result
-from countersign.service import ServiceError, VerificationService
+from countersign.trace import TraceBus, sse_stream
+from countersign.service import ServiceError, VerificationService, Verifier
 from countersign.vision_judge import device_tz_from_env
 
 log = logging.getLogger("countersign")
 
 WEBHOOK_SECRET_ENV = "EASYPOST_WEBHOOK_SECRET"
-Verifier = Callable[[datetime, bool], Awaitable[VerificationResult]]
 
 
 class VerifyRequest(BaseModel):
     delivered_at: AwareDatetime
     tracking_code: str | None = None
     simulate: bool = False
+
+
+class BindingRequest(BaseModel):
+    key: str = Field(min_length=1, description="tracker id (trk_...) or tracking code")
+    stream: Literal["package", "motion", "timeout"]
+    device_id: str | None = None
+    offline: bool = False
 
 
 class ApprovalRequest(BaseModel):
@@ -59,11 +67,21 @@ def default_verifier() -> Verifier:
     ring = RingClient()
     bedrock: Any = None
 
-    async def run(delivered_at: datetime, simulate: bool) -> VerificationResult:
+    async def run(
+        delivered_at: datetime, simulate: bool, binding: StreamBinding | None = None
+    ) -> VerificationResult:
         nonlocal bedrock
         if bedrock is None:
             bedrock = make_client("bedrock-runtime")
-        offline = simulate or os.environ.get(OFFLINE_ENV) == "true"
+        offline = simulate or os.environ.get(OFFLINE_ENV) == "true" or bool(binding and binding.offline)
+        extra: dict[str, Any] = {}
+        if binding:
+            if binding.device_id:
+                extra["device_id"] = binding.device_id
+            if binding.stream == "timeout":
+                extra["frames_fn"] = forced_timeout_frames
+            if binding.offline:
+                extra["synthetic_has_parcel"] = binding.stream == "package"
         return await verify_delivery(
             delivered_at,
             ring,
@@ -73,6 +91,7 @@ def default_verifier() -> Verifier:
             # Simulated runs must be able to reach a verdict; the service layer
             # still refuses claims and packets for synthetic evidence.
             config=PolicyConfig(allow_synthetic=offline),
+            **extra,
         )
 
     return run
@@ -84,9 +103,10 @@ def create_app(
     sink: EvidenceSink | None = None,
     trackers: TrackerLookup | None = None,
     recheck_delay_s: float | None = None,
+    trace: TraceBus | None = None,
 ) -> FastAPI:
     service = VerificationService(
-        verifier or default_verifier(), ledger, sink, trackers, recheck_delay_s
+        verifier or default_verifier(), ledger, sink, trackers, recheck_delay_s, trace
     )
     mcp_app = build_mcp(service).http_app(path="/")
 
@@ -139,11 +159,45 @@ def create_app(
             source="webhook",
             delivered_at=delivered_at,
             tracking_code=result.get("tracking_code"),
+            tracker_id=result.get("id"),
             event_id=event.get("id"),
         )
         if created:
+            _trace_webhook(service.trace, v.id, event, bool(secret))
             tasks.add_task(service.run, v.id)
         return {"id": v.id, "status": v.status, "duplicate": not created}
+
+    @app.get("/api/trace")
+    async def trace_stream(
+        request: Request,
+        verification_id: str | None = None,
+        last_event_id: int | None = None,
+        follow: bool = True,
+    ) -> StreamingResponse:
+        """Server-Sent Events: pipeline stages as they happen.
+
+        Replays history after ``Last-Event-ID`` (header or ``last_event_id``),
+        then follows live unless ``follow=false``.
+        """
+        header = request.headers.get("last-event-id", "")
+        last = last_event_id if last_event_id is not None else (int(header) if header.isdigit() else 0)
+        return StreamingResponse(
+            sse_stream(service.trace, request.is_disconnected, verification_id, last, follow),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @app.post("/api/bindings", status_code=201)
+    async def set_binding(req: BindingRequest) -> dict[str, Any]:
+        """Bind a tracker to a demo stream. Off unless COUNTERSIGN_SCENARIOS=true."""
+        if os.environ.get(SCENARIOS_ENV) != "true":
+            raise HTTPException(404, "scenario bindings are disabled")
+        service.bindings[req.key] = StreamBinding(req.stream, req.device_id, req.offline)
+        return {"key": req.key, "stream": req.stream, "device_id": req.device_id, "offline": req.offline}
+
+    @app.get("/api/ledger")
+    async def ledger_alias() -> list[dict[str, Any]]:
+        return [v.to_dict() for v in service.list()]
 
     @app.get("/verifications")
     async def list_verifications() -> list[dict[str, Any]]:
@@ -180,6 +234,23 @@ def create_app(
         return {"location": ref.location, "sha256": ref.sha256}
 
     return app
+
+
+def _trace_webhook(bus: TraceBus, vid: str, event: dict[str, Any], signature_checked: bool) -> None:
+    """Show the raw webhook in the trace, but only for EasyPost test-mode events."""
+    mode = event.get("mode")
+    result = event.get("result") or {}
+    data: dict[str, Any] = {
+        "mode": mode,
+        "event_id": event.get("id"),
+        "description": event.get("description"),
+        "tracking_code": result.get("tracking_code"),
+        "carrier_status": result.get("status"),
+        "signature_checked": signature_checked,
+    }
+    if mode == "test":
+        data["payload"] = event
+    bus.publish(vid, "webhook_received", "ok", **data)
 
 
 def _valid_signature(secret: str, body: bytes, headers: Any) -> bool:

@@ -16,6 +16,7 @@ from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont
 
+from countersign import trace
 from countersign.policy import Source
 from countersign.ring_client import RingClient
 
@@ -163,6 +164,7 @@ async def grab_frames(
             offer_sdp=pc.localDescription.sdp,
             token=token,
         )
+        trace.emit("whep_session", "ok", device_id=device_id, state="created")
         await pc.setRemoteDescription(RTCSessionDescription(sdp=answer_sdp, type="answer"))
 
         try:
@@ -172,6 +174,8 @@ async def grab_frames(
 
         if not frames:
             detail = f": {errors[0]!r}" if errors else ""
+            trace.emit("whep_session", "error", device_id=device_id, state="no_frames",
+                       timeout_s=timeout_seconds, detail=detail.lstrip(": ") or None)
             raise FrameCaptureError(
                 f"No video frames received within {timeout_seconds}s{detail}"
             )
@@ -188,6 +192,7 @@ async def grab_frames(
             await client.stop_whep(
                 device_id=device_id, session_id_or_url=session_id_or_url, token=token
             )
+            trace.emit("whep_session", "info", device_id=device_id, state="closed")
 
 
 def synthetic_frames(
@@ -202,6 +207,12 @@ def synthetic_frames(
         )
         for _ in range(n_frames)
     ]
+
+
+async def forced_timeout_frames(*args: Any, **kwargs: Any) -> list[Frame]:
+    """Scenario stand-in for a stream that never produces frames."""
+    trace.emit("whep_session", "error", state="no_frames", detail="forced timeout (scenario)")
+    raise FrameCaptureError("No video frames received (forced timeout scenario)")
 
 
 async def get_camera_frames(
