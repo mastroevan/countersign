@@ -44,6 +44,7 @@ class VerificationResult:
     evidence: list[FrameEvidence]
     frames: list[Frame]  # raw JPEGs, kept for the (approval-gated) evidence packet
     frames_requested: int
+    config: PolicyConfig = PolicyConfig()  # the config the decision was made with
 
     @property
     def partial_capture(self) -> bool:
@@ -59,6 +60,7 @@ class VerificationResult:
             "synthetic": d.synthetic,
             "positive_frames": d.positive_frames,
             "negative_frames": d.negative_frames,
+            "confidence": d.confidence,
             "considered_frames": d.considered_frames,
             "excluded_synthetic": d.excluded_synthetic,
             "unusable_timestamps": d.unusable_timestamps,
@@ -142,6 +144,24 @@ async def verify_delivery(
         evidence=evidence,
         frames=frames,
         frames_requested=n_frames,
+        config=config,
+    )
+
+
+def combine_results(first: VerificationResult, second: VerificationResult) -> VerificationResult:
+    """Merge two capture runs for one delivery and re-run the policy over ALL
+    observations. Verdicts stay policy-derived: e.g. an empty porch followed by
+    a visible parcel is a conflict (INCONCLUSIVE), never an automatic DISPUTED."""
+    evidence = first.evidence + second.evidence
+    observations = [e.observation for e in evidence if e.observation is not None]
+    return VerificationResult(
+        decision=decide(observations, first.delivered_at, first.config),
+        delivered_at=first.delivered_at,
+        device_id=second.device_id,
+        evidence=evidence,
+        frames=first.frames + second.frames,
+        frames_requested=first.frames_requested + second.frames_requested,
+        config=first.config,
     )
 
 

@@ -16,6 +16,7 @@ from countersign.pipeline import VerificationResult
 Action = Literal["claim_draft", "evidence_packet"]
 ACTIONS: tuple[Action, ...] = ("claim_draft", "evidence_packet")
 Status = Literal["pending", "complete", "failed"]
+RecheckState = Literal["none", "scheduled", "done"]
 
 
 @dataclass
@@ -41,6 +42,13 @@ class Verification:
     approvals: dict[Action, Approval] = field(default_factory=dict)
     claim_draft: dict[str, Any] | None = None
     evidence_location: str | None = None
+    evidence_sha256: str | None = None
+    checked_at: datetime | None = None  # when the latest capture run finished
+    # A DISPUTED verdict is provisional until a re-check has run.
+    recheck_state: RecheckState = "none"
+    recheck_due_at: datetime | None = None
+    recheck_error: str | None = None
+    runs: int = 0  # capture runs merged into ``result``
 
     @property
     def synthetic(self) -> bool:
@@ -73,6 +81,12 @@ class Verification:
             },
             "claim_draft": self.claim_draft,
             "evidence_location": self.evidence_location,
+            "evidence_sha256": self.evidence_sha256,
+            "checked_at": self.checked_at.isoformat() if self.checked_at else None,
+            "recheck_state": self.recheck_state,
+            "recheck_due_at": self.recheck_due_at.isoformat() if self.recheck_due_at else None,
+            "recheck_error": self.recheck_error,
+            "runs": self.runs,
         }
 
 
@@ -114,5 +128,13 @@ class Ledger:
     def get(self, verification_id: str) -> Verification | None:
         return self._items.get(verification_id)
 
-    def list(self) -> list[Verification]:
-        return sorted(self._items.values(), key=lambda v: v.created_at, reverse=True)
+    def list(self, since: datetime | None = None) -> list[Verification]:
+        items = [v for v in self._items.values() if since is None or v.created_at >= since]
+        return sorted(items, key=lambda v: v.created_at, reverse=True)
+
+    def find_by_tracking_code(self, tracking_code: str) -> Verification | None:
+        """Most recent verification for a tracking code."""
+        for v in self.list():
+            if v.tracking_code == tracking_code:
+                return v
+        return None
