@@ -20,7 +20,7 @@ def make_verifier(visible, source: str = "live", n: int = 2):
     """``visible`` may be a bool, or a list giving the outcome of each successive call."""
     calls = {"n": 0}
 
-    async def run(delivered_at, simulate):
+    async def run(delivered_at, simulate, binding=None):
         k = calls["n"]
         calls["n"] += 1
         vis = visible[min(k, len(visible) - 1)] if isinstance(visible, list) else visible
@@ -42,7 +42,7 @@ def make_verifier(visible, source: str = "live", n: int = 2):
 
 
 def boom_verifier():
-    async def run(delivered_at, simulate):
+    async def run(delivered_at, simulate, binding=None):
         raise RuntimeError("bedrock down")
 
     return run
