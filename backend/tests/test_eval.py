@@ -45,3 +45,16 @@ def test_committed_labels_load_and_dry_run_passes(capsys):
 
 def test_real_only_with_no_real_frames_exits_nonzero():
     assert main(["--dry-run", "--real-only"]) == 2
+
+
+def test_every_frame_is_accounted_for_even_with_judge_errors():
+    labels = [L(True), L(True), L(False), L(False), L(False)]
+    preds = [O(True), None, None, O(True), O(False)]
+    m = compute_metrics(labels, preds)
+    assert m.errors == 2 and m.unjudged_negatives == 1
+    assert m.tp + m.fp + m.fn + m.tn + m.unjudged_negatives == m.n
+
+
+def test_default_labels_path_works_from_any_directory(monkeypatch, tmp_path, capsys):
+    monkeypatch.chdir(tmp_path)
+    assert main(["--dry-run"]) == 0

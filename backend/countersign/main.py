@@ -24,6 +24,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import AwareDatetime, BaseModel, Field
 
+from countersign.aws import make_client
 from countersign.evidence import EvidenceSink
 from countersign.frames import OFFLINE_ENV
 from countersign.ledger import Ledger
@@ -60,9 +61,7 @@ def default_verifier() -> Verifier:
     async def run(delivered_at: datetime, simulate: bool) -> VerificationResult:
         nonlocal bedrock
         if bedrock is None:
-            import boto3
-
-            bedrock = boto3.client("bedrock-runtime")
+            bedrock = make_client("bedrock-runtime")
         offline = simulate or os.environ.get(OFFLINE_ENV) == "true"
         return await verify_delivery(
             delivered_at,
@@ -70,7 +69,9 @@ def default_verifier() -> Verifier:
             bedrock,
             device_tz=device_tz_from_env(),
             force_synthetic=offline,
-            config=PolicyConfig(),
+            # Simulated runs must be able to reach a verdict; the service layer
+            # still refuses claims and packets for synthetic evidence.
+            config=PolicyConfig(allow_synthetic=offline),
         )
 
     return run

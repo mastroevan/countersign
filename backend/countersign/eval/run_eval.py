@@ -16,8 +16,12 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from countersign.aws import make_client
 from countersign.policy import Observation
 from countersign.vision_judge import judge_frame
+
+# backend/eval/frames/labels.csv, independent of the current directory
+DEFAULT_LABELS = Path(__file__).resolve().parents[2] / "eval" / "frames" / "labels.csv"
 
 Judge = Callable[[bytes, str], Observation]  # (jpeg bytes, filename) -> Observation
 
@@ -40,6 +44,7 @@ class Metrics:
     tn: int
     location_correct: int
     location_total: int
+    unjudged_negatives: int = 0  # judge errors on frames labeled no-parcel
 
     @property
     def precision(self) -> float:
@@ -72,12 +77,14 @@ def compute_metrics(
 ) -> Metrics:
     """A prediction counts as positive only if visible AND confidence >= threshold,
     matching how the policy treats low-confidence frames (ignored)."""
-    tp = fp = fn = tn = errors = loc_ok = loc_total = 0
+    tp = fp = fn = tn = errors = loc_ok = loc_total = unjudged_neg = 0
     for lab, obs in zip(labels, predictions):
         if obs is None:
             errors += 1
             if lab.parcel_visible:
                 fn += 1  # a frame we could not judge is a missed parcel
+            else:
+                unjudged_neg += 1  # neither a true negative nor a false positive
             continue
         pred = obs.parcel_visible and obs.confidence >= min_confidence
         if lab.parcel_visible and pred:
@@ -90,7 +97,7 @@ def compute_metrics(
             fp += 1
         else:
             tn += 1
-    return Metrics(len(labels), errors, tp, fp, fn, tn, loc_ok, loc_total)
+    return Metrics(len(labels), errors, tp, fp, fn, tn, loc_ok, loc_total, unjudged_neg)
 
 
 def evaluate(
@@ -108,7 +115,7 @@ def evaluate(
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--labels", type=Path, default=Path("eval/frames/labels.csv"))
+    ap.add_argument("--labels", type=Path, default=DEFAULT_LABELS)
     ap.add_argument("--min-confidence", type=float, default=0.80)
     ap.add_argument("--min-precision", type=float, default=0.95)
     ap.add_argument("--min-recall", type=float, default=0.90)
@@ -130,15 +137,13 @@ def main(argv: list[str] | None = None) -> int:
             lab = by_name[name]
             return Observation(lab.parcel_visible, 1.0, lab.location)
     else:
-        import boto3
-
-        client = boto3.client("bedrock-runtime")
+        client = make_client("bedrock-runtime")
 
         def judge(img: bytes, _: str) -> Observation:
             return judge_frame(client, img)
 
     m = evaluate(labels, args.labels.parent, judge, args.min_confidence)
-    print(f"frames={m.n} errors={m.errors}  TP={m.tp} FP={m.fp} FN={m.fn} TN={m.tn}")
+    print(f"frames={m.n} errors={m.errors} (unjudged negatives={m.unjudged_negatives})  TP={m.tp} FP={m.fp} FN={m.fn} TN={m.tn}")
     print(f"precision={m.precision:.3f} recall={m.recall:.3f} location_accuracy={m.location_accuracy:.3f}")
     if args.dry_run:
         print("(dry run: oracle predictions, not a model result)")

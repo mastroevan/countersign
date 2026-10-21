@@ -203,3 +203,29 @@ def test_blank_approver_rejected():
     vid = verify(c)
     assert approve(c, vid, "evidence_packet", approver="").status_code == 422
     assert approve(c, vid, "evidence_packet", approver="   ").status_code == 422
+
+
+def test_default_verifier_simulate_reaches_a_verdict_but_never_actionable(monkeypatch):
+    """Regression: simulate=True used PolicyConfig() and was always INCONCLUSIVE."""
+    import countersign.main as main_mod
+    from countersign.vision_judge import TOOL_NAME
+
+    class StubBedrock:
+        def converse(self, **kw):
+            ts = (T0 + timedelta(minutes=1)).isoformat()
+            inp = {
+                "parcel_visible": True,
+                "confidence": 0.95,
+                "location": "porch",
+                "watermark_timestamp": ts,
+            }
+            return {"output": {"message": {"content": [{"toolUse": {"name": TOOL_NAME, "input": inp}}]}}}
+
+    monkeypatch.setenv("BEDROCK_MODEL_ID", "m")
+    monkeypatch.setattr(main_mod, "make_client", lambda service: StubBedrock())
+    c = TestClient(create_app(ledger=Ledger(), sink=MemorySink()))  # real default verifier
+    vid = c.post("/verify", json={"delivered_at": T0.isoformat(), "simulate": True}).json()["id"]
+    body = c.get(f"/verifications/{vid}").json()
+    assert body["result"]["verdict"] == "VERIFIED"
+    assert body["synthetic"] is True and body["result"]["synthetic"] is True
+    assert approve(c, vid, "evidence_packet").status_code == 409
