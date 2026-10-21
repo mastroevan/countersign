@@ -13,7 +13,7 @@ from pathlib import Path
 
 from countersign.frames import create_synthetic_frame
 
-FRAMES_DIR = Path("eval/frames")
+FRAMES_DIR = Path(__file__).resolve().parents[2] / "eval" / "frames"
 CASES = [
     # (parcel_visible, location)
     (True, "porch"),

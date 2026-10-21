@@ -21,9 +21,10 @@ from datetime import datetime
 from typing import Any, AsyncIterator, Literal
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import AwareDatetime, BaseModel, Field
 
+from countersign.aws import make_client
 from countersign.evidence import EvidenceSink
 from countersign.frames import OFFLINE_ENV
 from countersign.ledger import Ledger
@@ -31,6 +32,7 @@ from countersign.mcp_server import build_mcp
 from countersign.pipeline import VerificationResult, verify_delivery
 from countersign.policy import PolicyConfig
 from countersign.ring_client import RingClient
+from countersign.trackers import TrackerLookup, delivered_at_from_result
 from countersign.service import ServiceError, VerificationService
 from countersign.vision_judge import device_tz_from_env
 
@@ -60,9 +62,7 @@ def default_verifier() -> Verifier:
     async def run(delivered_at: datetime, simulate: bool) -> VerificationResult:
         nonlocal bedrock
         if bedrock is None:
-            import boto3
-
-            bedrock = boto3.client("bedrock-runtime")
+            bedrock = make_client("bedrock-runtime")
         offline = simulate or os.environ.get(OFFLINE_ENV) == "true"
         return await verify_delivery(
             delivered_at,
@@ -70,7 +70,9 @@ def default_verifier() -> Verifier:
             bedrock,
             device_tz=device_tz_from_env(),
             force_synthetic=offline,
-            config=PolicyConfig(),
+            # Simulated runs must be able to reach a verdict; the service layer
+            # still refuses claims and packets for synthetic evidence.
+            config=PolicyConfig(allow_synthetic=offline),
         )
 
     return run
@@ -80,8 +82,12 @@ def create_app(
     verifier: Verifier | None = None,
     ledger: Ledger | None = None,
     sink: EvidenceSink | None = None,
+    trackers: TrackerLookup | None = None,
+    recheck_delay_s: float | None = None,
 ) -> FastAPI:
-    service = VerificationService(verifier or default_verifier(), ledger, sink)
+    service = VerificationService(
+        verifier or default_verifier(), ledger, sink, trackers, recheck_delay_s
+    )
     mcp_app = build_mcp(service).http_app(path="/")
 
     @asynccontextmanager
@@ -125,7 +131,7 @@ def create_app(
 
         if result.get("status") != "delivered":
             return {"ignored": f"status is {result.get('status')!r}, not delivered"}
-        delivered_at = _delivered_at(result)
+        delivered_at = delivered_at_from_result(result)
         if delivered_at is None:
             raise HTTPException(422, "no timezone-aware delivery timestamp in event")
 
@@ -143,6 +149,14 @@ def create_app(
     async def list_verifications() -> list[dict[str, Any]]:
         return [v.to_dict() for v in service.list()]
 
+    @app.get("/verifications/{vid}/frames/{frame_id}.jpg")
+    async def get_frame(vid: str, frame_id: str) -> Response:
+        v = service.get(vid)
+        for f in v.result.frames if v.result else []:
+            if f.frame_id == frame_id:
+                return Response(f.jpeg, media_type="image/jpeg")
+        raise HTTPException(404, "frame not found")
+
     @app.get("/verifications/{vid}")
     async def get_verification(vid: str) -> dict[str, Any]:
         return service.get(vid).to_dict()
@@ -151,13 +165,19 @@ def create_app(
     async def record_approval(vid: str, req: ApprovalRequest) -> dict[str, Any]:
         return service.record_approval(vid, req.action, req.approved, req.approver).to_dict()
 
+    @app.post("/verifications/{vid}/recheck")
+    async def recheck(vid: str) -> dict[str, Any]:
+        """Re-check now (what the timer does after RECHECK_DELAY_S)."""
+        return (await service.recheck(vid)).to_dict()
+
     @app.post("/verifications/{vid}/claim-draft")
     async def make_claim_draft(vid: str) -> dict[str, Any]:
         return service.claim_draft(vid)
 
     @app.post("/verifications/{vid}/evidence-packet")
     async def make_evidence_packet(vid: str) -> dict[str, Any]:
-        return {"location": await service.evidence_packet(vid)}
+        ref = await service.evidence_packet(vid)
+        return {"location": ref.location, "sha256": ref.sha256}
 
     return app
 
@@ -168,20 +188,6 @@ def _valid_signature(secret: str, body: bytes, headers: Any) -> bool:
     key = unicodedata.normalize("NFKD", secret).encode()
     expected = "hmac-sha256-hex=" + hmac.new(key, body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(given, expected)
-
-
-def _delivered_at(result: dict[str, Any]) -> datetime | None:
-    details = [
-        d for d in result.get("tracking_details") or [] if d.get("status") == "delivered"
-    ]
-    if not details:
-        return None
-    raw = details[-1].get("datetime")
-    try:
-        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return dt if dt.tzinfo else None
 
 
 app = create_app()
