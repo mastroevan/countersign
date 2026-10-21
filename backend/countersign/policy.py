@@ -63,6 +63,9 @@ class Decision:
     synthetic: bool = False  # any considered frame was synthetic
     excluded_synthetic: int = 0  # synthetic frames dropped by config
     unusable_timestamps: int = 0  # frames with a missing/naive watermark
+    # Lowest confidence among the frames that back the verdict (conservative);
+    # None for INCONCLUSIVE, which has no backing frames.
+    confidence: float | None = None
 
 
 def decide(
@@ -122,6 +125,12 @@ def decide(
     synthetic = any(o.source == "synthetic" for o in confident)
 
     def result(verdict: Verdict, reason: str) -> Decision:
+        basis = positive if verdict is Verdict.VERIFIED else negative
+        conf = (
+            min(o.confidence for o in basis)
+            if basis and verdict is not Verdict.INCONCLUSIVE
+            else None
+        )
         return Decision(
             verdict,
             reason,
@@ -131,6 +140,7 @@ def decide(
             synthetic=synthetic,
             excluded_synthetic=excluded_synthetic,
             unusable_timestamps=unusable_ts,
+            confidence=conf,
         )
 
     if n_all == 0:
