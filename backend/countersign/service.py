@@ -170,6 +170,9 @@ class VerificationService:
 
     async def _timed_recheck(self, vid: str) -> None:
         try:
+            v = self.ledger.get(vid)
+            if v is not None and v.recheck_state == "done":
+                return  # a manual re-check already ran; don't capture again and wipe approvals
             await self.recheck(vid)
         except Exception:
             log.exception("scheduled re-check of %s failed", vid)

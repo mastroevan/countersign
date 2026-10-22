@@ -38,6 +38,15 @@ async def test_timer_fires_recheck_after_delay():
 
 
 @pytest.mark.asyncio
+async def test_stale_timer_skips_after_manual_recheck():
+    s = service(False, delay=0.1)
+    v = await disputed(s)
+    await s.recheck(v.id)  # user clicked Re-check Now
+    await asyncio.sleep(0.3)
+    assert v.runs == 2  # the timer did not capture a third time
+
+
+@pytest.mark.asyncio
 async def test_verified_never_schedules_and_simulated_dispute_does_but_stays_unclaimable():
     s = service(True)
     v = await disputed(s)

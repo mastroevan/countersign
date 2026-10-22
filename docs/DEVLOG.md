@@ -32,3 +32,13 @@ request IDs. Defects found by code review and fixed:
   dependencies. Streamable HTTP initialize with protocol 2025-11-25 is covered
   by `tests/test_mcp.py`. Note `mcp.types.LATEST_PROTOCOL_VERSION` is now
   2026-07-28, newer than the 2025-11-25 in CLAUDE.md.
+
+## 2026-10-21 — Stale re-check timer ran after a manual re-check
+
+- Request ID: n/a (no network call; reproduced with the synthetic verifier).
+- Expected: after "Re-check Now", the scheduled timer is a no-op.
+- Actual: the timer still called `recheck`, capturing a third run and clearing the
+  approvals and claim draft the human had just given. Repro: DISPUTED run, manual
+  recheck (runs=2), wait past `recheck_delay_s` -> runs=3.
+- Fix: `_timed_recheck` returns when `recheck_state == "done"`;
+  `test_stale_timer_skips_after_manual_recheck`.
