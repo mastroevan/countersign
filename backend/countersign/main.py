@@ -72,12 +72,16 @@ def default_verifier() -> Verifier:
         delivered_at: datetime, simulate: bool, binding: StreamBinding | None = None
     ) -> VerificationResult:
         nonlocal bedrock
-        if bedrock is None:
-            if os.environ.get("COUNTERSIGN_STUB_BEDROCK") == "true" or os.environ.get("BEDROCK_MODEL_ID") in ("x", "stub", "stub-model", "pixel"):
-                bedrock = PixelBedrock()
-            else:
-                bedrock = make_client("bedrock-runtime")
         offline = simulate or os.environ.get(OFFLINE_ENV) == "true" or bool(binding and binding.offline)
+        use_stub = os.environ.get("COUNTERSIGN_STUB_BEDROCK") == "true" or os.environ.get(
+            "BEDROCK_MODEL_ID"
+        ) in ("x", "stub", "stub-model", "pixel")
+        if use_stub and not offline:
+            # The stub reads one pixel of the synthetic parcel; on live frames it
+            # would invent confident observations.
+            raise RuntimeError("stub Bedrock is for synthetic frames only; unset it for live runs")
+        if bedrock is None:
+            bedrock = PixelBedrock() if use_stub else make_client("bedrock-runtime")
         extra: dict[str, Any] = {}
         if binding:
             if binding.device_id:

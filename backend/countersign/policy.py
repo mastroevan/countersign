@@ -46,6 +46,9 @@ class PolicyConfig:
     min_negative_frames: int = 2  # confident "not visible" frames for DISPUTED
     window_before: timedelta = timedelta(minutes=5)
     window_after: timedelta = timedelta(minutes=30)
+    # A parcel seen before the carrier scan may be an earlier parcel. Allow only
+    # a little clock skew between the carrier scan and the camera.
+    positive_skew: timedelta = timedelta(seconds=60)
     allowed_locations: frozenset[str] = frozenset({"step", "porch"})
     # Synthetic frames are ignored unless a demo explicitly opts in. Even then
     # the Decision is flagged ``synthetic`` and the approval layer refuses it.
@@ -110,7 +113,10 @@ def decide(
     positive = [
         o
         for o in confident
-        if o.parcel_visible and o.location in config.allowed_locations
+        if o.parcel_visible
+        and o.location in config.allowed_locations
+        and o.watermark_ts is not None
+        and o.watermark_ts >= delivered_at - config.positive_skew
     ]
     # Negative frames that dispute delivery must occur at or after carrier scan time.
     # Pre-delivery absence (porch empty before carrier arrives) is normal baseline,

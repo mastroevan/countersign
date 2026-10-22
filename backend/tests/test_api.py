@@ -241,3 +241,12 @@ def test_default_verifier_simulate_reaches_a_verdict_but_never_actionable(monkey
     assert body["result"]["verdict"] == "VERIFIED"
     assert body["synthetic"] is True and body["result"]["synthetic"] is True
     assert approve(c, vid, "evidence_packet").status_code == 409
+
+
+def test_stub_bedrock_refused_for_live_runs(monkeypatch):
+    monkeypatch.setenv("BEDROCK_MODEL_ID", "stub-model")
+    monkeypatch.delenv("COUNTERSIGN_OFFLINE_SIMULATION", raising=False)
+    c = TestClient(create_app(ledger=Ledger(), sink=MemorySink()))  # real default verifier
+    vid = c.post("/verify", json={"delivered_at": T0.isoformat()}).json()["id"]
+    body = c.get(f"/verifications/{vid}").json()
+    assert body["status"] == "failed" and "stub Bedrock" in body["error"]

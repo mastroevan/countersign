@@ -43,7 +43,7 @@ def test_out_of_window_ignored():
 
 
 def test_window_boundaries_inclusive():
-    assert decide([obs(dt=-timedelta(minutes=5))], T0).verdict is Verdict.VERIFIED
+    assert decide([obs(dt=-timedelta(seconds=60))], T0).verdict is Verdict.VERIFIED
     assert decide([obs(dt=timedelta(minutes=30))], T0).verdict is Verdict.VERIFIED
 
 
@@ -123,3 +123,9 @@ def test_unusable_timestamps_counted_and_explained():
 def test_negative_exactly_at_delivery_time_counts():
     d = decide([obs(False, dt=timedelta(0)), obs(False, dt=timedelta(0))], T0)
     assert d.verdict is Verdict.DISPUTED
+
+
+def test_parcel_seen_well_before_scan_cannot_verify():
+    # Could be an earlier parcel: inside the window, but not positive evidence.
+    d = decide([obs(dt=-timedelta(minutes=4))], T0)
+    assert d.verdict is Verdict.INCONCLUSIVE
