@@ -32,3 +32,16 @@ request IDs. Defects found by code review and fixed:
   dependencies. Streamable HTTP initialize with protocol 2025-11-25 is covered
   by `tests/test_mcp.py`. Note `mcp.types.LATEST_PROTOCOL_VERSION` is now
   2026-07-28, newer than the 2025-11-25 in CLAUDE.md.
+
+## 2026-10-21 — TypeScript MCP Client negotiation & local Bedrock stub
+
+- **MCP Protocol Negotiation**: The `@modelcontextprotocol/sdk` TypeScript client
+  (`StreamableHTTPClientTransport`) negotiates protocol version `2025-11-25`.
+  The Python FastMCP server accepts and returns `2025-11-25`, fully satisfying
+  the requirement of `2025-11-25` or later.
+- **No-credential local scenario testing**: Added `PixelBedrock` fallback in
+  `backend/countersign/aws.py` and `main.py` when `BEDROCK_MODEL_ID` is set to
+  `x`, `stub`, `stub-model`, or `pixel` (or `COUNTERSIGN_STUB_BEDROCK=true`).
+  This allows running `python -m countersign.scenarios <name> --offline`
+  end-to-end against the local server without active AWS Bedrock credentials.
+
