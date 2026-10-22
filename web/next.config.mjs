@@ -3,6 +3,7 @@ const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:8000";
 
 const nextConfig = {
   reactStrictMode: false,
+  skipTrailingSlashRedirect: true,
   async rewrites() {
     return [
       {
@@ -20,6 +21,10 @@ const nextConfig = {
       {
         source: "/webhooks/:path*",
         destination: `${BACKEND_URL}/webhooks/:path*`,
+      },
+      {
+        source: "/mcp/",
+        destination: `${BACKEND_URL}/mcp/`,
       },
       {
         source: "/mcp/:path*",

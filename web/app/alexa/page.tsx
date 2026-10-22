@@ -124,7 +124,7 @@ export default function AlexaSimulatorPage() {
         "@modelcontextprotocol/sdk/client/streamableHttp.js"
       );
 
-      const mcpUrl = new URL("/mcp", window.location.origin);
+      const mcpUrl = new URL("/mcp/", window.location.origin);
       const httpTransport = new StreamableHTTPClientTransport(mcpUrl);
 
       const client = new Client(
