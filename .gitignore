@@ -51,3 +51,6 @@ Thumbs.db
 .claude/history/
 *.log
 .claude/settings.local.json
+
+# TypeScript build info
+*.tsbuildinfo
