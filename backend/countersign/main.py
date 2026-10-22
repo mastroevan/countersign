@@ -24,7 +24,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import AwareDatetime, BaseModel, Field
 
-from countersign.aws import make_client
+from countersign.aws import PixelBedrock, make_client
 from countersign.evidence import EvidenceSink
 from countersign.bindings import SCENARIOS_ENV, StreamBinding
 from countersign.frames import OFFLINE_ENV, forced_timeout_frames
@@ -72,7 +72,10 @@ def default_verifier() -> Verifier:
     ) -> VerificationResult:
         nonlocal bedrock
         if bedrock is None:
-            bedrock = make_client("bedrock-runtime")
+            if os.environ.get("COUNTERSIGN_STUB_BEDROCK") == "true" or os.environ.get("BEDROCK_MODEL_ID") in ("x", "stub", "stub-model", "pixel"):
+                bedrock = PixelBedrock()
+            else:
+                bedrock = make_client("bedrock-runtime")
         offline = simulate or os.environ.get(OFFLINE_ENV) == "true" or bool(binding and binding.offline)
         extra: dict[str, Any] = {}
         if binding:
