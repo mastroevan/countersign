@@ -21,6 +21,7 @@ from datetime import datetime
 from typing import Any, AsyncIterator, Literal
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import AwareDatetime, BaseModel, Field
 
@@ -119,6 +120,14 @@ def create_app(
             yield
 
     app = FastAPI(title="Countersign", lifespan=lifespan)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["*"],
+    )
     app.mount("/mcp", mcp_app)  # Streamable HTTP MCP endpoint at /mcp/
 
     @app.exception_handler(ServiceError)
