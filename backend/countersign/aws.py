@@ -26,7 +26,9 @@ class PixelBedrock:
         from PIL import Image
 
         img = kw["messages"][0]["content"][0]["image"]["source"]["bytes"]
-        r, g, b = Image.open(io.BytesIO(img)).convert("RGB").getpixel((320, 310))
+        pixel = Image.open(io.BytesIO(img)).convert("RGB").getpixel((320, 310))
+        assert isinstance(pixel, tuple)
+        r, g, b = pixel[:3]
         visible = r > 160 and b < 130  # parcel box is (185, 142, 95); porch floor is grey
         inp = {
             "parcel_visible": visible,

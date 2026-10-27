@@ -73,16 +73,21 @@ def default_verifier() -> Verifier:
     ) -> VerificationResult:
         nonlocal bedrock
         offline = simulate or os.environ.get(OFFLINE_ENV) == "true" or bool(binding and binding.offline)
-        use_stub = os.environ.get("COUNTERSIGN_STUB_BEDROCK") == "true" or os.environ.get(
-            "BEDROCK_MODEL_ID"
-        ) in ("x", "stub", "stub-model", "pixel")
+        model_env = os.environ.get("BEDROCK_MODEL_ID")
+        explicit_stub = os.environ.get("COUNTERSIGN_STUB_BEDROCK") == "true" or model_env in (
+            "x", "stub", "stub-model", "pixel",
+        )
+        # Offline with no model configured has nothing real to call: use the stub, so
+        # `--offline` demos work with zero credentials. Set BEDROCK_MODEL_ID (and AWS
+        # credentials) to have a real model judge the synthetic frames instead.
+        use_stub = explicit_stub or (offline and not model_env)
         if use_stub and not offline:
             # The stub reads one pixel of the synthetic parcel; on live frames it
             # would invent confident observations.
             raise RuntimeError("stub Bedrock is for synthetic frames only; unset it for live runs")
         if bedrock is None:
             bedrock = PixelBedrock() if use_stub else make_client("bedrock-runtime")
-        extra: dict[str, Any] = {}
+        extra: dict[str, Any] = {"model_id": "stub-pixel"} if use_stub else {}
         if binding:
             if binding.device_id:
                 extra["device_id"] = binding.device_id
