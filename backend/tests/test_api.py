@@ -250,3 +250,33 @@ def test_stub_bedrock_refused_for_live_runs(monkeypatch):
     vid = c.post("/verify", json={"delivered_at": T0.isoformat()}).json()["id"]
     body = c.get(f"/verifications/{vid}").json()
     assert body["status"] == "failed" and "stub Bedrock" in body["error"]
+
+
+def test_offline_demo_needs_no_credentials_or_model_id(monkeypatch):
+    """Regression: a fresh clone's `--offline` demo failed (no stub, no credentials)."""
+    monkeypatch.delenv("BEDROCK_MODEL_ID", raising=False)
+    monkeypatch.delenv("COUNTERSIGN_STUB_BEDROCK", raising=False)
+    monkeypatch.delenv("COUNTERSIGN_OFFLINE_SIMULATION", raising=False)
+    monkeypatch.setenv("AWS_CONFIG_FILE", "/nonexistent")
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", "/nonexistent")
+    c = TestClient(create_app(ledger=Ledger(), sink=MemorySink()))  # real default verifier
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    vid = c.post("/verify", json={"delivered_at": now.isoformat(), "simulate": True}).json()["id"]
+    body = c.get(f"/verifications/{vid}").json()
+    assert body["status"] == "complete", body["error"]
+    assert body["result"]["verdict"] == "VERIFIED" and body["synthetic"] is True
+    trace = c.get("/api/trace", params={"verification_id": vid, "follow": "false"}).text
+    assert "stub-pixel" in trace
+
+
+def test_stub_refused_on_live_frames(monkeypatch):
+    monkeypatch.setenv("COUNTERSIGN_STUB_BEDROCK", "true")
+    monkeypatch.delenv("COUNTERSIGN_OFFLINE_SIMULATION", raising=False)
+    c = TestClient(create_app(ledger=Ledger(), sink=MemorySink()))
+    from datetime import datetime, timezone
+
+    vid = c.post("/verify", json={"delivered_at": datetime.now(timezone.utc).isoformat()}).json()["id"]
+    body = c.get(f"/verifications/{vid}").json()
+    assert body["status"] == "failed" and "synthetic frames only" in body["error"]
